@@ -203,19 +203,23 @@ end"""
 
     def generate_neb_input(
         self,
-        initial_atoms: Atoms,
-        final_atoms: Atoms,
+        initial_atoms: Optional[Atoms] = None,
+        final_atoms: Optional[Atoms] = None,
         output_file: Optional[Union[str, Path]] = None,
-        neb_images: Optional[int] = None
+        neb_images: Optional[int] = None,
+        initial_xyz_file: Optional[Union[str, Path]] = None,
+        final_xyz_file: Optional[Union[str, Path]] = None
     ) -> str:
         """
         Generate ORCA NEB-TS input file.
         
         Args:
-            initial_atoms: Initial structure (reactant) as ASE Atoms
-            final_atoms: Final structure (product) as ASE Atoms
+            initial_atoms: Initial structure (reactant) as ASE Atoms (optional if initial_xyz_file provided)
+            final_atoms: Final structure (product) as ASE Atoms (optional if final_xyz_file provided)
             output_file: Path to save input file
             neb_images: Number of NEB images (optional, ORCA will auto-determine if not specified)
+            initial_xyz_file: Path to initial XYZ file (preferred - uses optimized structure)
+            final_xyz_file: Path to final XYZ file (preferred - uses optimized structure)
         
         Returns:
             Input file content as string
@@ -223,16 +227,44 @@ end"""
         if not ASE_AVAILABLE:
             raise ImportError("ASE is required. Install with: pip install ase")
         
-        # Verify atom ordering is consistent
-        initial_symbols = initial_atoms.get_chemical_symbols()
-        final_symbols = final_atoms.get_chemical_symbols()
+        # Determine XYZ file paths
+        if output_file:
+            output_path = Path(output_file)
+            if initial_xyz_file:
+                initial_xyz_path = Path(initial_xyz_file)
+            else:
+                initial_xyz_path = output_path.parent / "initial.xyz"
+            
+            if final_xyz_file:
+                final_xyz_path = Path(final_xyz_file)
+            else:
+                final_xyz_path = output_path.parent / "final.xyz"
+            
+            # Use relative paths if in same directory
+            if initial_xyz_path.parent == output_path.parent:
+                initial_xyz_ref = initial_xyz_path.name
+            else:
+                initial_xyz_ref = str(initial_xyz_path)
+            
+            if final_xyz_path.parent == output_path.parent:
+                final_xyz_ref = final_xyz_path.name
+            else:
+                final_xyz_ref = str(final_xyz_path)
+        else:
+            initial_xyz_ref = initial_xyz_file if initial_xyz_file else "initial.xyz"
+            final_xyz_ref = final_xyz_file if final_xyz_file else "final.xyz"
         
-        if len(initial_symbols) != len(final_symbols):
-            raise ValueError(f"Initial and final structures must have same number of atoms. "
-                           f"Got {len(initial_symbols)} vs {len(final_symbols)}")
-        
-        if initial_symbols != final_symbols:
-            raise ValueError("Initial and final structures must have identical atom ordering")
+        # If XYZ files are provided, use them; otherwise verify atom ordering consistency
+        if initial_atoms is not None and final_atoms is not None:
+            initial_symbols = initial_atoms.get_chemical_symbols()
+            final_symbols = final_atoms.get_chemical_symbols()
+            
+            if len(initial_symbols) != len(final_symbols):
+                raise ValueError(f"Initial and final structures must have same number of atoms. "
+                               f"Got {len(initial_symbols)} vs {len(final_symbols)}")
+            
+            if initial_symbols != final_symbols:
+                raise ValueError("Initial and final structures must have identical atom ordering")
         
         # Build command line with NEB-TS keyword
         command_parts = [f"!{self.method} {self.basis_set}"]
@@ -277,59 +309,42 @@ end"""
             ])
         
         # NEB block
-        # Determine final XYZ file path (relative to input file location)
-        if output_file:
-            output_path = Path(output_file)
-            final_xyz_path = output_path.parent / "final.xyz"
-            # Use relative path if in same directory, otherwise absolute
-            if final_xyz_path.parent == output_path.parent:
-                final_xyz_ref = "final.xyz"
-            else:
-                final_xyz_ref = str(final_xyz_path)
-        else:
-            final_xyz_ref = "final.xyz"
-        
         neb_block = [
             "",
             "%NEB",
             f'  NEB_END_XYZFILE "{final_xyz_ref}"',
             "  PREOPT_ENDS TRUE",
+            "END"
         ]
-        
-        if neb_images is not None:
-            neb_block.append(f"  NEB_IMAGES {neb_images}")
-        
-        neb_block.append("END")
         lines.extend(neb_block)
         
-        # Initial structure coordinates
+        # Use XYZFILE to read initial structure from file (preferred for optimized structures)
         lines.extend([
             "",
-            f"* xyz {self.charge} {self.multiplicity}",
+            f"* XYZFILE {self.charge} {self.multiplicity} {initial_xyz_ref}",
         ])
         
-        symbols = initial_atoms.get_chemical_symbols()
-        positions = initial_atoms.get_positions()
-        
-        for symbol, pos in zip(symbols, positions):
-            lines.append(
-                f"  {symbol:4s} {pos[0]:15.10f} {pos[1]:15.10f} {pos[2]:15.10f}"
-            )
-        
-        lines.append("*")
-        
         input_content = "\n".join(lines)
+        if not input_content.endswith("\n"):
+            input_content += "\n"
         
         # Save input file
         if output_file:
             output_path = Path(output_file)
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(output_path, 'w') as f:
+            with open(output_path, 'w', encoding='utf-8', newline='\n') as f:
                 f.write(input_content)
             
-            # Save final structure as XYZ file
-            final_xyz_path = output_path.parent / "final.xyz"
-            self._export_xyz(final_atoms, final_xyz_path)
+            # Export structures to XYZ files if provided and files don't exist
+            if initial_atoms is not None:
+                initial_xyz_path = output_path.parent / "initial.xyz"
+                if not initial_xyz_path.exists():
+                    self._export_xyz(initial_atoms, initial_xyz_path)
+            
+            if final_atoms is not None:
+                final_xyz_path = output_path.parent / "final.xyz"
+                if not final_xyz_path.exists():
+                    self._export_xyz(final_atoms, final_xyz_path)
         
         return input_content
     

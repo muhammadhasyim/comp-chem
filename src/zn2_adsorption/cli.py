@@ -112,6 +112,20 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         default=4,
         help="Number of processors for ORCA (default: 4)"
     )
+    parser.add_argument(
+        "--scf-convergence",
+        type=str,
+        default="TightSCF",
+        choices=["TightSCF", "NormalSCF", "LooseSCF"],
+        help="SCF convergence criteria (default: 'TightSCF')"
+    )
+    parser.add_argument(
+        "--grid",
+        type=int,
+        default=4,
+        choices=[1, 2, 3, 4, 5, 6, 7],
+        help="Integration grid quality (1-7, higher is better but slower) (default: 4)"
+    )
     
     # Execution and output parameters
     parser.add_argument(
@@ -290,27 +304,39 @@ def run_orca_command(input_file: Path, output_file: Path, orca_path: str) -> boo
         # Check output file for actual errors (not just exit code)
         # ORCA may return non-zero if interrupted, but still produce valid output
         if output_file.exists() and output_file.stat().st_size > 0:
-            with open(output_file, 'r') as f:
-                content = f.read()
-                # Check for actual input errors
-                if "INPUT ERROR" in content or "UNRECOGNIZED" in content:
-                    print(f"  Error: ORCA input error for {input_file.name}. Check {output_file.name} for details.")
-                    return False
-                # Check for segmentation fault
-                if "segmentation fault" in content.lower() or "SIGSEGV" in content:
-                    print(f"  Error: ORCA crashed (segmentation fault) for {input_file.name}. Check {output_file.name} for details.")
-                    return False
-                # If ORCA started processing, consider it successful
-                if "Starting time:" in content and ("Geometry Optimization" in content or "SCF" in content or "ORCA TERMINATED" in content):
-                    if result.returncode == 0:
-                        print(f"  ✓ ORCA completed successfully for {input_file.name}")
-                    elif result.returncode == -11:
-                        # SIGSEGV - segmentation fault
-                        print(f"  ✗ ORCA crashed (segmentation fault) for {input_file.name}. Check {output_file.name} for details.")
-                        return False
-                    else:
-                        print(f"  ⚠ ORCA was interrupted for {input_file.name} (exit code {result.returncode}). Check {output_file.name} for progress.")
+            try:
+                # Try reading as text with error handling for binary data
+                with open(output_file, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+            except Exception as e:
+                # Fallback: try reading as binary and decode with error handling
+                try:
+                    with open(output_file, 'rb') as f:
+                        content = f.read().decode('utf-8', errors='replace')
+                except Exception:
+                    # If we can't read it at all, assume it's still running or corrupted
+                    print(f"  Warning: Could not read {output_file.name} (may contain binary data). Assuming calculation is running.")
                     return True
+            
+            # Check for actual input errors
+            if "INPUT ERROR" in content or "UNRECOGNIZED" in content:
+                print(f"  Error: ORCA input error for {input_file.name}. Check {output_file.name} for details.")
+                return False
+            # Check for segmentation fault
+            if "segmentation fault" in content.lower() or "SIGSEGV" in content:
+                print(f"  Error: ORCA crashed (segmentation fault) for {input_file.name}. Check {output_file.name} for details.")
+                return False
+            # If ORCA started processing, consider it successful
+            if "Starting time:" in content and ("Geometry Optimization" in content or "SCF" in content or "ORCA TERMINATED" in content or "NEB" in content):
+                if result.returncode == 0:
+                    print(f"  ✓ ORCA completed successfully for {input_file.name}")
+                elif result.returncode == -11:
+                    # SIGSEGV - segmentation fault
+                    print(f"  ✗ ORCA crashed (segmentation fault) for {input_file.name}. Check {output_file.name} for details.")
+                    return False
+                else:
+                    print(f"  ⚠ ORCA was interrupted for {input_file.name} (exit code {result.returncode}). Check {output_file.name} for progress.")
+                return True
         
         # If we get here, something went wrong
         if result.returncode != 0:
@@ -334,7 +360,7 @@ def extract_energy_from_orca(output_file: Path) -> Optional[float]:
         
     energy = None
     try:
-        with open(output_file, 'r') as f:
+        with open(output_file, 'r', encoding='utf-8', errors='replace') as f:
             for line in f:
                 if "FINAL SINGLE POINT ENERGY" in line:
                     parts = line.split()
@@ -344,6 +370,100 @@ def extract_energy_from_orca(output_file: Path) -> Optional[float]:
         print(f"  Error parsing {output_file.name}: {e}")
         
     return energy
+
+def extract_optimized_geometry_from_orca(output_file: Path, xyz_file: Path) -> bool:
+    """
+    Extract the final optimized geometry from ORCA output and write to XYZ file.
+    
+    Args:
+        output_file: Path to ORCA output file (.out)
+        xyz_file: Path to write XYZ file
+        
+    Returns:
+        True if successful, False otherwise
+    """
+    if not output_file.exists():
+        return False
+    
+    try:
+        with open(output_file, 'r', encoding='utf-8', errors='replace') as f:
+            lines = f.readlines()
+        
+        # Find the last occurrence of "CARTESIAN COORDINATES (ANGSTROEM)"
+        last_coord_start = -1
+        for i in range(len(lines) - 1, -1, -1):
+            if "CARTESIAN COORDINATES (ANGSTROEM)" in lines[i]:
+                last_coord_start = i
+                break
+        
+        if last_coord_start == -1:
+            # Try to read from existing XYZ file if ORCA created one
+            xyz_auto = output_file.with_suffix('.xyz')
+            if xyz_auto.exists():
+                import shutil
+                shutil.copy2(xyz_auto, xyz_file)
+                return True
+            return False
+        
+        # Parse coordinates (skip separator line, read until blank line or next section)
+        coords = []
+        i = last_coord_start + 2  # Skip header and separator line
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line or line.startswith('-') or line.startswith('='):
+                # Check if we've read all coordinates (next section starting)
+                if coords and (line.startswith('CARTESIAN') or 'NO LB' in line or 'FINAL' in line.upper()):
+                    break
+                if not line:
+                    i += 1
+                    continue
+                if line.startswith('-') and coords:
+                    break
+            
+            # Parse coordinate line: "  C      0.019688    1.388033   15.004487"
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    symbol = parts[0]
+                    x = float(parts[1])
+                    y = float(parts[2])
+                    z = float(parts[3])
+                    coords.append((symbol, x, y, z))
+                except (ValueError, IndexError):
+                    pass
+            
+            i += 1
+        
+        if not coords:
+            # Fallback: try to read from auto-generated XYZ file
+            xyz_auto = output_file.with_suffix('.xyz')
+            if xyz_auto.exists():
+                import shutil
+                shutil.copy2(xyz_auto, xyz_file)
+                return True
+            return False
+        
+        # Write XYZ file
+        with open(xyz_file, 'w') as f:
+            f.write(f"{len(coords)}\n")
+            f.write(f"Optimized geometry from {output_file.name}\n")
+            for symbol, x, y, z in coords:
+                f.write(f"{symbol:4s} {x:15.10f} {y:15.10f} {z:15.10f}\n")
+        
+        return True
+        
+    except Exception as e:
+        print(f"  Warning: Could not extract optimized geometry from {output_file.name}: {e}")
+        # Fallback: try to read from auto-generated XYZ file
+        xyz_auto = output_file.with_suffix('.xyz')
+        if xyz_auto.exists():
+            try:
+                import shutil
+                shutil.copy2(xyz_auto, xyz_file)
+                return True
+            except Exception:
+                pass
+        return False
 
 def parse_neb_output(output_file: Path) -> Dict[str, Optional[float]]:
     """
@@ -375,7 +495,7 @@ def parse_neb_output(output_file: Path) -> Dict[str, Optional[float]]:
     }
     
     try:
-        with open(output_file, 'r') as f:
+        with open(output_file, 'r', encoding='utf-8', errors='replace') as f:
             content = f.read()
             lines = content.split('\n')
             
@@ -469,7 +589,9 @@ def run_calculation(args: argparse.Namespace):
         solvent=args.solvent,
         solvation_model=args.solvation,
         memory=args.memory,
-        nprocs=args.nprocs
+        nprocs=args.nprocs,
+        scf_convergence=args.scf_convergence,
+        grid=f"DefGrid{args.grid}"
     )
     calc = NebCalculator(orca_generator=orca_gen)
     
@@ -527,25 +649,48 @@ def run_calculation(args: argparse.Namespace):
             print("\n--- Step 1: Pre-optimizing initial endpoint ---")
             initial_inp = output_dir / "initial.inp"
             initial_out = output_dir / "initial.out"
+            initial_xyz = output_dir / "initial.xyz"
             if run_orca_command(initial_inp, initial_out, orca_path):
                 initial_energy = extract_energy_from_orca(initial_out)
                 output_data["energies"]["initial"] = initial_energy
                 if initial_energy is not None:
                     print(f"  Initial endpoint energy: {initial_energy:.8f} Hartree")
+                
+                # Extract optimized geometry
+                if extract_optimized_geometry_from_orca(initial_out, initial_xyz):
+                    print(f"  Updated {initial_xyz.name} with optimized geometry")
             
             # Step 2: Pre-optimize final endpoint (unconstrained)
             print("\n--- Step 2: Pre-optimizing final endpoint ---")
             final_inp = output_dir / "final.inp"
             final_out = output_dir / "final.out"
+            final_xyz = output_dir / "final.xyz"
             if run_orca_command(final_inp, final_out, orca_path):
                 final_energy = extract_energy_from_orca(final_out)
                 output_data["energies"]["final"] = final_energy
                 if final_energy is not None:
                     print(f"  Final endpoint energy: {final_energy:.8f} Hartree")
+                
+                # Extract optimized geometry
+                if extract_optimized_geometry_from_orca(final_out, final_xyz):
+                    print(f"  Updated {final_xyz.name} with optimized geometry")
+            
+            # Regenerate neb.inp using optimized XYZ files
+            print("\n--- Regenerating NEB input with optimized endpoints ---")
+            neb_inp = output_dir / "neb.inp"
+            if initial_xyz.exists() and final_xyz.exists():
+                neb_input = orca_gen.generate_neb_input(
+                    output_file=neb_inp,
+                    neb_images=neb_images,
+                    initial_xyz_file=initial_xyz,
+                    final_xyz_file=final_xyz
+                )
+                print(f"  Regenerated {neb_inp.name} using optimized structures")
+            else:
+                print(f"  Warning: Could not regenerate {neb_inp.name} - XYZ files missing")
             
             # Step 3: Run NEB calculation
             print("\n--- Step 3: Running NEB-TS calculation ---")
-            neb_inp = output_dir / "neb.inp"
             neb_out = output_dir / "neb.out"
             if run_orca_command(neb_inp, neb_out, orca_path):
                 neb_results = parse_neb_output(neb_out)

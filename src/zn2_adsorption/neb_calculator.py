@@ -146,10 +146,11 @@ class NebCalculator:
             self._export_xyz(initial_ase, output_dir / "initial.xyz")
             self._export_xyz(final_ase, output_dir / "final.xyz")
         
-        # 9. Generate NEB input file
+        # 9. Generate NEB input file (initially with unoptimized structures)
+        # This will be regenerated after optimizations complete
         neb_input = self.orca_gen.generate_neb_input(
-            initial_ase,
-            final_ase,
+            initial_atoms=initial_ase,
+            final_atoms=final_ase,
             output_file=output_dir / "neb.inp" if output_dir else None,
             neb_images=neb_images
         )
