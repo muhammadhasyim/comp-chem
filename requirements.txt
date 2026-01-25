@@ -1,0 +1,10 @@
+pymatgen>=2024.1.20
+ase>=3.22.1
+numpy>=1.24.0
+scipy>=1.10.0
+matplotlib>=3.7.0
+ccinput>=1.0.0
+rdkit>=2022.9.5
+pytest>=7.0.0
+ruff>=0.1.0
+mypy>=1.0.0

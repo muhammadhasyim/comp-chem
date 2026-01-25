@@ -1,0 +1,38 @@
+# ORCA software and inputs
+orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/
+orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg.tar.xz
+orca_inputs/
+
+# Results files (keep config files)
+*.json
+!pyproject.toml
+!package.json
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
