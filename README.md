@@ -11,49 +11,157 @@ This tool automates the workflow for finding minimum energy paths (MEP) and tran
 
 ## Installation
 
-1. Clone the repository:
+### Prerequisites
+
+- Python 3.9 or higher
+- ORCA 6.1.1 or later (optional, for running calculations)
+- pip package manager
+
+### Step 1: Clone the Repository
+
+```bash
+git clone https://github.com/muhammadhasyim/comp-chem.git
+cd comp-chem
+```
+
+### Step 2: Install Python Dependencies
+
+Install the package and its dependencies in editable mode:
+
+```bash
+pip install -e .
+```
+
+This will install:
+- `pymatgen` - Materials structure generation
+- `ase` - Atomic Simulation Environment
+- `numpy`, `scipy` - Numerical computing
+- `matplotlib` - Plotting (optional)
+- `rdkit` - Molecular chemistry toolkit
+
+### Step 3: Verify Installation
+
+Check that the CLI tool is available:
+
+```bash
+run-adsorption --help
+```
+
+You should see the help message with all available command-line options.
+
+### Step 4: Set Up ORCA (Optional)
+
+If you want to run calculations automatically (not just generate input files):
+
+1. **Download ORCA**: Get ORCA 6.1.1 or later from [ORCA Forum](https://orcaforum.kofo.mpg.de)
+
+2. **Extract ORCA**: Place the ORCA folder in your project directory or system PATH
+
+3. **Verify ORCA Detection**: The tool will automatically detect ORCA in:
+   - Project directory (folders containing "orca" in the name)
+   - System PATH (excluding system screen reader)
+
+   To test:
    ```bash
-   git clone https://github.com/muhammadhasyim/comp-chem.git
-   cd comp-chem
+   run-adsorption --start-distance 5.0 --end-distance 2.5 --run-orca
    ```
 
-2. Install the package in editable mode:
-   ```bash
-   pip install -e .
-   ```
+### Troubleshooting Installation
 
-3. Verify installation:
-   ```bash
-   run-adsorption --help
-   ```
+**Issue: `ERROR: Could not find a version that satisfies the requirement install`**
+- **Solution**: Use exactly `pip install -e .` or `pip install .`. Do not combine commands (e.g., avoid `pip install . install -e .`).
 
-### Troubleshooting
+**Issue: `ModuleNotFoundError: No module named 'pymatgen'`**
+- **Solution**: Install dependencies explicitly:
+  ```bash
+  pip install -r requirements.txt
+  pip install -e .
+  ```
 
-If you encounter an error like `ERROR: Could not find a version that satisfies the requirement install`, make sure you are using exactly `pip install -e .` or `pip install .`. Do not combine them (e.g., avoid `pip install . install -e .`).
+**Issue: `ERROR: Could not find a version that satisfies the requirement rdkit-pypi`**
+- **Solution**: The package name is `rdkit`, not `rdkit-pypi`. Update `requirements.txt` if needed.
+
+**Issue: ORCA not detected**
+- **Solution**: 
+  - Place ORCA folder in the project directory (e.g., `comp-chem/orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/`)
+  - Or add ORCA to your system PATH
+  - The tool will automatically set `LD_LIBRARY_PATH` for ORCA's shared libraries
 
 ## Usage
 
 The tool provides a command-line interface `run-adsorption` for NEB calculations.
 
-### Basic Example
+### Basic Usage: Generate Input Files Only
 
-Calculate NEB path from Zn²⁺ at 5.0 Å to 2.5 Å from the surface:
-
-```bash
-run-adsorption --carboxyl 2 --hydroxyl 1 --size 4x4 \
-    --start-distance 5.0 --end-distance 2.5
-```
-
-### Run with ORCA
-
-To automatically run the calculations (if ORCA is available):
+Generate ORCA input files without running calculations:
 
 ```bash
-run-adsorption --carboxyl 2 --hydroxyl 1 --size 4x4 \
-    --start-distance 5.0 --end-distance 2.5 --run-orca
+run-adsorption \
+    --carboxyl 2 \
+    --hydroxyl 1 \
+    --size 4x4 \
+    --start-distance 5.0 \
+    --end-distance 2.5
 ```
+
+This creates:
+- `initial.inp` - Initial endpoint optimization
+- `final.inp` - Final endpoint optimization  
+- `neb.inp` - NEB-TS calculation
+- `initial.xyz` / `final.xyz` - Structure files
+
+### Run with ORCA (Automatic Execution)
+
+To automatically run the calculations (requires ORCA to be installed):
+
+```bash
+run-adsorption \
+    --carboxyl 2 \
+    --hydroxyl 1 \
+    --size 4x4 \
+    --start-distance 5.0 \
+    --end-distance 2.5 \
+    --run-orca
+```
+
+The workflow will:
+1. Generate input files
+2. Run initial endpoint optimization
+3. Run final endpoint optimization
+4. Extract optimized geometries
+5. Regenerate NEB input with optimized structures
+6. Run NEB-TS calculation
+7. Generate summary JSON file
+
+### Laptop-Optimized Settings
+
+For faster calculations on limited resources:
+
+```bash
+run-adsorption \
+    --carboxyl 0 \
+    --hydroxyl 0 \
+    --size 2x2 \
+    --start-distance 5.0 \
+    --end-distance 2.5 \
+    --basis def2-SVP \
+    --grid 3 \
+    --scf-convergence NormalSCF \
+    --memory 8GB \
+    --nprocs 2 \
+    --run-orca
+```
+
+**Settings explanation:**
+- `--basis def2-SVP`: Smaller basis set (faster than def2-TZVP)
+- `--grid 3`: Lower integration grid (faster, slightly less accurate)
+- `--scf-convergence NormalSCF`: Less strict convergence (faster)
+- `--memory 8GB`: Lower memory allocation
+- `--nprocs 2`: Fewer processors
 
 ### Advanced Options
+
+Full control over all parameters:
 
 ```bash
 run-adsorption \
@@ -64,15 +172,51 @@ run-adsorption \
     --end-distance 2.0 \
     --neb-images 15 \
     --method PBE0 \
-    --basis def2-SVP \
+    --basis def2-TZVP \
     --solvent water \
     --solvation CPCM \
+    --scf-convergence TightSCF \
+    --grid 4 \
     --memory 32GB \
     --nprocs 8 \
     --output-dir ./neb_calc \
     --run-orca \
     --json-output ./neb_results.json
 ```
+
+### Running Calculations Manually
+
+If you prefer to run ORCA manually:
+
+1. **Generate input files** (without `--run-orca`):
+   ```bash
+   run-adsorption --start-distance 5.0 --end-distance 2.5
+   ```
+
+2. **Run initial endpoint optimization**:
+   ```bash
+   cd orca_inputs
+   export LD_LIBRARY_PATH=/path/to/orca/lib:$LD_LIBRARY_PATH
+   /path/to/orca initial.inp > initial.out 2>&1
+   ```
+
+3. **Run final endpoint optimization**:
+   ```bash
+   /path/to/orca final.inp > final.out 2>&1
+   ```
+
+4. **Regenerate NEB input** (the tool will do this automatically if you use `--run-orca`):
+   ```bash
+   cd ..
+   run-adsorption --start-distance 5.0 --end-distance 2.5
+   # This will regenerate neb.inp with optimized structures
+   ```
+
+5. **Run NEB calculation**:
+   ```bash
+   cd orca_inputs
+   /path/to/orca neb.inp > neb.out 2>&1
+   ```
 
 ### Command-Line Flags
 
@@ -90,19 +234,33 @@ run-adsorption \
 | `--solvation` | | Solvation model ('CPCM' or 'SMD') | 'CPCM' |
 | `--memory` | | Memory allocation (e.g., '16GB', '32GB') | '16GB' |
 | `--nprocs` | | Number of processors | 4 |
+| `--scf-convergence` | | SCF convergence criteria ('TightSCF', 'NormalSCF', 'LooseSCF') | 'TightSCF' |
+| `--grid` | | Integration grid quality (1-7, higher is better but slower) | 4 |
 | `--output-dir` | `-O` | Directory for ORCA files | './orca_inputs' |
 | `--run-orca` | | Attempt to run ORCA if available | False |
 | `--json-output` | | Path for results JSON file | './neb_results.json' |
 
 ## Workflow
 
-The NEB calculation proceeds in three steps:
+The NEB calculation proceeds in three main steps:
 
-1. **Pre-optimize initial endpoint**: Constrained geometry optimization with Zn²⁺ at `--start-distance`
-2. **Pre-optimize final endpoint**: Constrained geometry optimization with Zn²⁺ at `--end-distance`
-3. **NEB-TS calculation**: Find minimum energy path and transition state between endpoints
+1. **Pre-optimize initial endpoint**: Unconstrained geometry optimization starting from Zn²⁺ at `--start-distance`
+   - Generates `initial.inp` and runs optimization
+   - Extracts optimized geometry to `initial.xyz`
+   - Energy saved to results
 
-Both endpoints are optimized with distance constraints to ensure they maintain their specified distances before the NEB calculation.
+2. **Pre-optimize final endpoint**: Unconstrained geometry optimization starting from Zn²⁺ at `--end-distance`
+   - Generates `final.inp` and runs optimization
+   - Extracts optimized geometry to `final.xyz`
+   - Energy saved to results
+
+3. **NEB-TS calculation**: Find minimum energy path and transition state between optimized endpoints
+   - Regenerates `neb.inp` using optimized `initial.xyz` and `final.xyz` files
+   - Uses `* XYZFILE` to read optimized structures
+   - Uses `PREOPT_ENDS TRUE` to allow ORCA to further optimize endpoints during NEB
+   - Finds transition state and calculates barrier height
+
+**Note**: The endpoint optimizations are unconstrained. ORCA's `PREOPT_ENDS TRUE` keyword handles re-optimization of endpoints during the NEB calculation itself.
 
 ## Output Files
 
