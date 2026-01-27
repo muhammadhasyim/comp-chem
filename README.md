@@ -234,33 +234,38 @@ If you prefer to run ORCA manually:
 | `--solvation` | | Solvation model ('CPCM' or 'SMD') | 'CPCM' |
 | `--memory` | | Memory allocation (e.g., '16GB', '32GB') | '16GB' |
 | `--nprocs` | | Number of processors | 4 |
+| `--no-mpi` | | Disable MPI/parallel execution - run ORCA in serial mode (nprocs=1) | False |
 | `--scf-convergence` | | SCF convergence criteria ('TightSCF', 'NormalSCF', 'LooseSCF') | 'TightSCF' |
 | `--grid` | | Integration grid quality (1-7, higher is better but slower) | 4 |
 | `--output-dir` | `-O` | Directory for ORCA files | './orca_inputs' |
 | `--run-orca` | | Attempt to run ORCA if available | False |
+| `--skip-endpoint-opt` | | Skip pre-optimization of endpoints (PREOPT_ENDS will handle it). Faster but may converge slower. | False |
 | `--json-output` | | Path for results JSON file | './neb_results.json' |
 
 ## Workflow
 
-The NEB calculation proceeds in three main steps:
+The NEB calculation proceeds in three main steps (unless `--skip-endpoint-opt` is used):
 
-1. **Pre-optimize initial endpoint**: Unconstrained geometry optimization starting from Zn²⁺ at `--start-distance`
+1. **Pre-optimize initial endpoint** (optional, skipped with `--skip-endpoint-opt`): Unconstrained geometry optimization starting from Zn²⁺ at `--start-distance`
    - Generates `initial.inp` and runs optimization
    - Extracts optimized geometry to `initial.xyz`
    - Energy saved to results
 
-2. **Pre-optimize final endpoint**: Unconstrained geometry optimization starting from Zn²⁺ at `--end-distance`
+2. **Pre-optimize final endpoint** (optional, skipped with `--skip-endpoint-opt`): Unconstrained geometry optimization starting from Zn²⁺ at `--end-distance`
    - Generates `final.inp` and runs optimization
    - Extracts optimized geometry to `final.xyz`
    - Energy saved to results
 
-3. **NEB-TS calculation**: Find minimum energy path and transition state between optimized endpoints
-   - Regenerates `neb.inp` using optimized `initial.xyz` and `final.xyz` files
-   - Uses `* XYZFILE` to read optimized structures
-   - Uses `PREOPT_ENDS TRUE` to allow ORCA to further optimize endpoints during NEB
+3. **NEB-TS calculation**: Find minimum energy path and transition state between endpoints
+   - Uses optimized `initial.xyz` and `final.xyz` files (if pre-optimized) or unoptimized structures (if `--skip-endpoint-opt`)
+   - Uses `* XYZFILE` to read structures
+   - Uses `PREOPT_ENDS TRUE` to optimize endpoints during NEB (if not pre-optimized)
    - Finds transition state and calculates barrier height
 
-**Note**: The endpoint optimizations are unconstrained. ORCA's `PREOPT_ENDS TRUE` keyword handles re-optimization of endpoints during the NEB calculation itself.
+**Note**: 
+- By default, endpoints are pre-optimized separately for better starting geometries and separate energy values.
+- With `--skip-endpoint-opt`, ORCA's `PREOPT_ENDS TRUE` keyword will optimize endpoints during the NEB calculation itself, saving computation time but potentially requiring more NEB iterations.
+- The endpoint optimizations are unconstrained (no distance constraints).
 
 ## Output Files
 

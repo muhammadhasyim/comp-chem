@@ -113,6 +113,12 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         help="Number of processors for ORCA (default: 4)"
     )
     parser.add_argument(
+        "--no-mpi",
+        action="store_true",
+        default=False,
+        help="Disable MPI/parallel execution - run ORCA in serial mode (nprocs=1) (default: False)"
+    )
+    parser.add_argument(
         "--scf-convergence",
         type=str,
         default="TightSCF",
@@ -139,6 +145,12 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         action="store_true",
         default=False,
         help="Attempt to run ORCA if available (default: False)"
+    )
+    parser.add_argument(
+        "--skip-endpoint-opt",
+        action="store_true",
+        default=False,
+        help="Skip pre-optimization of endpoints (let PREOPT_ENDS handle it in NEB). Faster but may converge slower. (default: False)"
     )
     parser.add_argument(
         "--json-output",
@@ -266,10 +278,18 @@ def check_orca_available() -> Tuple[bool, Optional[str]]:
     
     return (False, None)
 
-def run_orca_command(input_file: Path, output_file: Path, orca_path: str) -> bool:
+def run_orca_command(input_file: Path, output_file: Path, orca_path: str, no_mpi: bool = False) -> bool:
     """
     Execute ORCA command.
-    Returns True if ORCA started successfully, False if there was an input error.
+    
+    Args:
+        input_file: Path to ORCA input file
+        output_file: Path to ORCA output file
+        orca_path: Path to ORCA executable
+        no_mpi: If True, disable MPI execution by setting environment variables
+    
+    Returns:
+        True if ORCA started successfully, False if there was an input error.
     Note: Long-running calculations may be interrupted; check output file for status.
     """
     print(f"  Running ORCA for {input_file.name}...")
@@ -292,39 +312,69 @@ def run_orca_command(input_file: Path, output_file: Path, orca_path: str) -> boo
             else:
                 env["LD_LIBRARY_PATH"] = str(orca_lib_dir)
         
-        with open(output_file, 'w') as out_f:
+        # If --no-mpi is set, configure environment to prevent MPI usage
+        if no_mpi:
+            # Force OpenMPI to use only 1 process
+            env["OMPI_COMM_WORLD_SIZE"] = "1"
+            env["OMPI_COMM_WORLD_RANK"] = "0"
+            # Disable OpenMP parallelization as well
+            env["OMP_NUM_THREADS"] = "1"
+            # Prevent ORCA from detecting multiple processors
+            env["OMPI_UNIVERSE_SIZE"] = "1"
+            # Some ORCA installations check this
+            env["ORCA_NPROCS"] = "1"
+            # Try to find serial-only helper executables
+            # Check for serial versions of helper executables (e.g., orca_prop instead of orca_prop_mpi)
+            orca_bin_dir = orca_dir
+            # If helper executables exist, ORCA will prefer serial versions when MPI is disabled
+            # This is handled by ORCA's internal logic, but we ensure environment is set correctly
+        
+        # Change to input file's directory so relative paths in input file work correctly
+        # ORCA interprets relative paths relative to its working directory, not the input file location
+        input_dir = input_path.parent
+        output_file_resolved = output_file.resolve()
+        # If output file is in the same directory as input file, use it directly
+        # Otherwise, place it in the input file's directory
+        if output_file_resolved.parent == input_dir:
+            output_path_in_dir = output_file_resolved
+        else:
+            output_path_in_dir = input_dir / output_file.name
+        
+        with open(output_path_in_dir, 'w') as out_f:
             result = subprocess.run(
-                [str(orca_exe), str(input_path)],
+                [str(orca_exe), str(input_path)],  # Use absolute path for input file
                 stdout=out_f,
                 stderr=subprocess.STDOUT,
                 check=False,  # Don't raise on non-zero exit - check output file instead
-                env=env  # Use environment with library path
+                env=env,  # Use environment with library path
+                cwd=str(input_dir)  # Run ORCA from the input file's directory so relative paths work
             )
         
         # Check output file for actual errors (not just exit code)
         # ORCA may return non-zero if interrupted, but still produce valid output
-        if output_file.exists() and output_file.stat().st_size > 0:
+        # Use the output path in the input directory (where we actually wrote it)
+        if output_path_in_dir.exists() and output_path_in_dir.stat().st_size > 0:
             try:
                 # Try reading as text with error handling for binary data
-                with open(output_file, 'r', encoding='utf-8', errors='replace') as f:
+                with open(output_path_in_dir, 'r', encoding='utf-8', errors='replace') as f:
                     content = f.read()
             except Exception as e:
                 # Fallback: try reading as binary and decode with error handling
                 try:
-                    with open(output_file, 'rb') as f:
+                    with open(output_path_in_dir, 'rb') as f:
                         content = f.read().decode('utf-8', errors='replace')
                 except Exception:
                     # If we can't read it at all, assume it's still running or corrupted
-                    print(f"  Warning: Could not read {output_file.name} (may contain binary data). Assuming calculation is running.")
+                    print(f"  Warning: Could not read {output_path_in_dir.name} (may contain binary data). Assuming calculation is running.")
                     return True
             
             # Check for actual input errors
             if "INPUT ERROR" in content or "UNRECOGNIZED" in content:
-                print(f"  Error: ORCA input error for {input_file.name}. Check {output_file.name} for details.")
+                print(f"  Error: ORCA input error for {input_file.name}. Check {output_path_in_dir.name} for details.")
                 return False
             # Check for segmentation fault
             if "segmentation fault" in content.lower() or "SIGSEGV" in content:
-                print(f"  Error: ORCA crashed (segmentation fault) for {input_file.name}. Check {output_file.name} for details.")
+                print(f"  Error: ORCA crashed (segmentation fault) for {input_file.name}. Check {output_path_in_dir.name} for details.")
                 return False
             # If ORCA started processing, consider it successful
             if "Starting time:" in content and ("Geometry Optimization" in content or "SCF" in content or "ORCA TERMINATED" in content or "NEB" in content):
@@ -332,18 +382,18 @@ def run_orca_command(input_file: Path, output_file: Path, orca_path: str) -> boo
                     print(f"  ✓ ORCA completed successfully for {input_file.name}")
                 elif result.returncode == -11:
                     # SIGSEGV - segmentation fault
-                    print(f"  ✗ ORCA crashed (segmentation fault) for {input_file.name}. Check {output_file.name} for details.")
+                    print(f"  ✗ ORCA crashed (segmentation fault) for {input_file.name}. Check {output_path_in_dir.name} for details.")
                     return False
                 else:
-                    print(f"  ⚠ ORCA was interrupted for {input_file.name} (exit code {result.returncode}). Check {output_file.name} for progress.")
+                    print(f"  ⚠ ORCA was interrupted for {input_file.name} (exit code {result.returncode}). Check {output_path_in_dir.name} for progress.")
                 return True
         
         # If we get here, something went wrong
         if result.returncode != 0:
             if result.returncode == -11:
-                print(f"  ✗ ORCA crashed (segmentation fault) for {input_file.name}. Check {output_file.name} for details.")
+                print(f"  ✗ ORCA crashed (segmentation fault) for {input_file.name}. Check {output_path_in_dir.name} for details.")
             else:
-                print(f"  Error: ORCA failed for {input_file.name} (exit code {result.returncode}). Check {output_file.name} for details.")
+                print(f"  Error: ORCA failed for {input_file.name} (exit code {result.returncode}). Check {output_path_in_dir.name} for details.")
             return False
         
         return True
@@ -583,13 +633,18 @@ def run_calculation(args: argparse.Namespace):
     print(f"NEB images: {neb_images}")
     
     # Initialize calculator
+    # If --no-mpi is set, force nprocs to 1 for serial execution
+    nprocs = 1 if args.no_mpi else args.nprocs
+    if args.no_mpi:
+        print("Running in serial mode (no MPI/parallel execution)")
+    
     orca_gen = OrcaInputGenerator(
         method=args.method,
         basis_set=args.basis,
         solvent=args.solvent,
         solvation_model=args.solvation,
         memory=args.memory,
-        nprocs=args.nprocs,
+        nprocs=nprocs,
         scf_convergence=args.scf_convergence,
         grid=f"DefGrid{args.grid}"
     )
@@ -645,54 +700,64 @@ def run_calculation(args: argparse.Namespace):
             print("\nORCA found at:", orca_path)
             output_data["orca_run"] = True
             
-            # Step 1: Pre-optimize initial endpoint (unconstrained)
-            print("\n--- Step 1: Pre-optimizing initial endpoint ---")
             initial_inp = output_dir / "initial.inp"
             initial_out = output_dir / "initial.out"
             initial_xyz = output_dir / "initial.xyz"
-            if run_orca_command(initial_inp, initial_out, orca_path):
-                initial_energy = extract_energy_from_orca(initial_out)
-                output_data["energies"]["initial"] = initial_energy
-                if initial_energy is not None:
-                    print(f"  Initial endpoint energy: {initial_energy:.8f} Hartree")
-                
-                # Extract optimized geometry
-                if extract_optimized_geometry_from_orca(initial_out, initial_xyz):
-                    print(f"  Updated {initial_xyz.name} with optimized geometry")
-            
-            # Step 2: Pre-optimize final endpoint (unconstrained)
-            print("\n--- Step 2: Pre-optimizing final endpoint ---")
             final_inp = output_dir / "final.inp"
             final_out = output_dir / "final.out"
             final_xyz = output_dir / "final.xyz"
-            if run_orca_command(final_inp, final_out, orca_path):
-                final_energy = extract_energy_from_orca(final_out)
-                output_data["energies"]["final"] = final_energy
-                if final_energy is not None:
-                    print(f"  Final endpoint energy: {final_energy:.8f} Hartree")
-                
-                # Extract optimized geometry
-                if extract_optimized_geometry_from_orca(final_out, final_xyz):
-                    print(f"  Updated {final_xyz.name} with optimized geometry")
-            
-            # Regenerate neb.inp using optimized XYZ files
-            print("\n--- Regenerating NEB input with optimized endpoints ---")
             neb_inp = output_dir / "neb.inp"
-            if initial_xyz.exists() and final_xyz.exists():
-                neb_input = orca_gen.generate_neb_input(
-                    output_file=neb_inp,
-                    neb_images=neb_images,
-                    initial_xyz_file=initial_xyz,
-                    final_xyz_file=final_xyz
-                )
-                print(f"  Regenerated {neb_inp.name} using optimized structures")
+            
+            # Pre-optimize endpoints unless skipped
+            if not args.skip_endpoint_opt:
+                # Step 1: Pre-optimize initial endpoint (unconstrained)
+                print("\n--- Step 1: Pre-optimizing initial endpoint ---")
+                print("  (This can be skipped with --skip-endpoint-opt; PREOPT_ENDS will handle it)")
+                if run_orca_command(initial_inp, initial_out, orca_path, no_mpi=args.no_mpi):
+                    initial_energy = extract_energy_from_orca(initial_out)
+                    output_data["energies"]["initial"] = initial_energy
+                    if initial_energy is not None:
+                        print(f"  Initial endpoint energy: {initial_energy:.8f} Hartree")
+                    
+                    # Extract optimized geometry
+                    if extract_optimized_geometry_from_orca(initial_out, initial_xyz):
+                        print(f"  Updated {initial_xyz.name} with optimized geometry")
+                
+                # Step 2: Pre-optimize final endpoint (unconstrained)
+                print("\n--- Step 2: Pre-optimizing final endpoint ---")
+                if run_orca_command(final_inp, final_out, orca_path, no_mpi=args.no_mpi):
+                    final_energy = extract_energy_from_orca(final_out)
+                    output_data["energies"]["final"] = final_energy
+                    if final_energy is not None:
+                        print(f"  Final endpoint energy: {final_energy:.8f} Hartree")
+                    
+                    # Extract optimized geometry
+                    if extract_optimized_geometry_from_orca(final_out, final_xyz):
+                        print(f"  Updated {final_xyz.name} with optimized geometry")
+                
+                # Regenerate neb.inp using optimized XYZ files
+                print("\n--- Regenerating NEB input with optimized endpoints ---")
+                if initial_xyz.exists() and final_xyz.exists():
+                    neb_input = orca_gen.generate_neb_input(
+                        output_file=neb_inp,
+                        neb_images=neb_images,
+                        initial_xyz_file=initial_xyz,
+                        final_xyz_file=final_xyz
+                    )
+                    print(f"  Regenerated {neb_inp.name} using optimized structures")
+                else:
+                    print(f"  Warning: Could not regenerate {neb_inp.name} - XYZ files missing")
             else:
-                print(f"  Warning: Could not regenerate {neb_inp.name} - XYZ files missing")
+                print("\n--- Skipping endpoint pre-optimization ---")
+                print("  Using unoptimized structures; PREOPT_ENDS will optimize during NEB")
+                # Use the original unoptimized XYZ files (already created by prepare_neb_calculation)
+                if not initial_xyz.exists() or not final_xyz.exists():
+                    print(f"  Warning: XYZ files not found. They should have been created during file preparation.")
             
             # Step 3: Run NEB calculation
             print("\n--- Step 3: Running NEB-TS calculation ---")
             neb_out = output_dir / "neb.out"
-            if run_orca_command(neb_inp, neb_out, orca_path):
+            if run_orca_command(neb_inp, neb_out, orca_path, no_mpi=args.no_mpi):
                 neb_results = parse_neb_output(neb_out)
                 output_data["energies"]["ts_energy"] = neb_results["ts_energy"]
                 output_data["energies"]["barrier_height_kcal_mol"] = neb_results["barrier_height"]

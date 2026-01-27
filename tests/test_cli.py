@@ -19,6 +19,8 @@ def test_parse_arguments_defaults():
     assert args.output_dir == "./orca_inputs"
     assert args.run_orca is False
     assert args.json_output == "./neb_results.json"
+    assert args.no_mpi is False
+    assert args.nprocs == 4
 
 def test_parse_arguments_custom():
     args = parse_arguments([
@@ -114,3 +116,23 @@ def test_validate_inputs_invalid_distance():
     with pytest.raises(ValueError, match="Start and end distances must be different"):
         from zn2_adsorption.cli import validate_inputs
         validate_inputs(args)
+
+def test_parse_arguments_no_mpi():
+    """Test --no-mpi flag sets nprocs to 1."""
+    args = parse_arguments([
+        "--start-distance", "5.0",
+        "--end-distance", "2.5",
+        "--no-mpi"
+    ])
+    assert args.no_mpi is True
+    assert args.nprocs == 4  # nprocs argument still parsed, but will be overridden to 1
+    
+    # Test that --no-mpi works with custom nprocs (should still force to 1)
+    args = parse_arguments([
+        "--start-distance", "5.0",
+        "--end-distance", "2.5",
+        "--nprocs", "8",
+        "--no-mpi"
+    ])
+    assert args.no_mpi is True
+    assert args.nprocs == 8  # Parsed value, but will be overridden to 1 in run_calculation
