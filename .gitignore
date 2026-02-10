@@ -2,6 +2,10 @@
 orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg/
 orca_6_1_1_linux_x86-64_shared_openmpi418_nodmrg.tar.xz
 orca_inputs/
+orca.*
+path.png
+nohup.out
+remote.out
 
 # Results files (keep config files)
 *.json
