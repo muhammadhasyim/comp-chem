@@ -1,10 +1,10 @@
-# Zn2+ Nudged Elastic Band (NEB) Path Calculator CLI
+# Zn2+ MEP Pipeline (FSM & NEB)
 
-A plug-and-play command-line script for students to calculate minimum energy paths for Zn2+ adsorption on functionalized carbon surfaces using ORCA's NEB-TS method.
+A command-line pipeline for minimum energy paths (MEP) of Zn²⁺ adsorbing on functionalized carbon surfaces. **Default:** Freezing String Method (FSM) with ORCA. **Option:** Nudged Elastic Band (NEB) with ORCA.
 
 ## Overview
 
-This tool automates the workflow for finding minimum energy paths (MEP) and transition states for Zn²⁺ adsorption on functionalized graphene surfaces using Nudged Elastic Band (NEB) calculations. It uses a hybrid approach:
+This tool automates the workflow for finding MEPs and transition states for Zn²⁺ adsorption on functionalized graphene surfaces. **By default** it uses the **Freezing String Method (FSM)** via the [ML-FSM](https://github.com/thegomeslab/ML-FSM) submodule with ORCA; use `--path-method neb` for the classic NEB-TS workflow. The pipeline uses a hybrid approach:
 - **pymatgen**: Provides periodic boundary conditions to eliminate edge effects.
 - **GOPY Logic**: Implements reliable functionalization patterns for carboxyl (-COOH) and hydroxyl (-OH) groups.
 - **ORCA**: Generates NEB-TS input files with constrained endpoint optimizations.
@@ -48,6 +48,8 @@ run-adsorption --help
 ```
 
 You should see the help message with all available command-line options.
+
+For the end-to-end MEP pipeline (FSM default, NEB option), see **[docs/MEP_pipeline.md](docs/MEP_pipeline.md)**.
 
 ### Step 4: Set Up ORCA (Optional)
 

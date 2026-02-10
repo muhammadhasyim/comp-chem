@@ -31,7 +31,7 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
     Parse command-line arguments for the adsorption calculator.
     """
     parser = argparse.ArgumentParser(
-        description="Zn2+ Nudged Elastic Band (NEB) Path Calculator CLI"
+        description="Zn2+ MEP pipeline: FSM (Freezing String) or NEB for adsorption path"
     )
     
     # Surface parameters
@@ -132,13 +132,78 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         choices=[1, 2, 3, 4, 5, 6, 7],
         help="Integration grid quality (1-7, higher is better but slower) (default: 4)"
     )
+    parser.add_argument(
+        "--chg",
+        type=int,
+        default=2,
+        help="Total charge (default: 2 for Zn²⁺@surface)"
+    )
+    parser.add_argument(
+        "--mult",
+        type=int,
+        default=1,
+        help="Spin multiplicity (default: 1)"
+    )
+    parser.add_argument(
+        "--orca-command",
+        type=str,
+        default=None,
+        help="Path to ORCA executable (default: auto-detect from repo or PATH)"
+    )
+    parser.add_argument(
+        "--orca-simple",
+        type=str,
+        default=None,
+        help="ORCA '!' line override (e.g. 'B3LYP def2-TZVP D3BJ CPCM(water)'). Default: built from --method, --basis, --solvent"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        default=False,
+        help="Verbose output (passed to FSM when --path-method fsm)"
+    )
+    
+    # Path method: NEB or FSM (Freezing String Method)
+    parser.add_argument(
+        "--path-method",
+        type=str,
+        default="fsm",
+        choices=["neb", "fsm"],
+        help="MEP method: 'fsm' (Freezing String) or 'neb' (Nudged Elastic Band) (default: 'fsm')"
+    )
+    # FSM-specific options (used when --path-method fsm)
+    parser.add_argument(
+        "--nnodes-min",
+        type=int,
+        default=10,
+        help="[FSM] Minimum number of nodes on the string (default: 10)"
+    )
+    parser.add_argument(
+        "--fsm-maxiter",
+        type=int,
+        default=2,
+        help="[FSM] Max optimization iterations per node (default: 2)"
+    )
+    parser.add_argument(
+        "--fsm-maxls",
+        type=int,
+        default=2,
+        help="[FSM] Max line-search iterations (default: 2)"
+    )
+    parser.add_argument(
+        "--fsm-suffix",
+        type=str,
+        default=None,
+        help="[FSM] Suffix for FSM output directory (default: None)"
+    )
     
     # Execution and output parameters
     parser.add_argument(
         "--output-dir", "-O",
         type=str,
         default="./orca_inputs",
-        help="Output directory for ORCA files (default: './orca_inputs')"
+        metavar="DIR",
+        help="Output directory for ORCA/FSM files; fsm_reaction is created under DIR (default: './orca_inputs')"
     )
     parser.add_argument(
         "--run-orca",
@@ -150,13 +215,13 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         "--skip-endpoint-opt",
         action="store_true",
         default=False,
-        help="Skip pre-optimization of endpoints (let PREOPT_ENDS handle it in NEB). Faster but may converge slower. (default: False)"
+        help="[NEB] Skip pre-optimization of endpoints (let PREOPT_ENDS handle it in NEB). Faster but may converge slower. (default: False)"
     )
     parser.add_argument(
         "--json-output",
         type=str,
-        default="./neb_results.json",
-        help="JSON output file path (default: './neb_results.json')"
+        default="./mep_results.json",
+        help="JSON output file path (default: './mep_results.json')"
     )
     
     return parser.parse_args(args)
@@ -610,14 +675,284 @@ def parse_neb_output(output_file: Path) -> Dict[str, Optional[float]]:
     
     return result
 
-def run_calculation(args: argparse.Namespace):
-    """Main NEB workflow orchestration."""
+def _prepare_fsm_reaction_dir(
+    output_dir: Path,
+    initial_xyz: Path,
+    final_xyz: Path,
+    charge: int = 2,
+    multiplicity: int = 1,
+) -> Path:
+    """
+    Create fsm_reaction directory with combined initial.xyz (two frames) and chg, mult.
+    Returns path to fsm_reaction directory.
+    """
+    fsm_dir = output_dir / "fsm_reaction"
+    fsm_dir.mkdir(parents=True, exist_ok=True)
+    # Read initial and final XYZ (standard: line1 natoms, line2 comment, then coords)
+    ini_lines = initial_xyz.read_text().strip().splitlines()
+    fin_lines = final_xyz.read_text().strip().splitlines()
+    if not ini_lines or not fin_lines:
+        raise ValueError(f"Empty XYZ: {initial_xyz} or {final_xyz}")
+    n_ini = int(ini_lines[0])
+    n_fin = int(fin_lines[0])
+    if n_ini != n_fin:
+        raise ValueError(f"Atom count mismatch: initial {n_ini} vs final {n_fin}")
+    # Combined initial.xyz for ML-FSM: frame1 = initial, frame2 = final
+    combined = "\n".join(ini_lines) + "\n" + "\n".join(fin_lines) + "\n"
+    (fsm_dir / "initial.xyz").write_text(combined)
+    (fsm_dir / "chg").write_text(str(charge) + "\n")
+    (fsm_dir / "mult").write_text(str(multiplicity) + "\n")
+    return fsm_dir
+
+
+def _parse_fsm_vfile(vfile_path: Path) -> Tuple[List[Tuple[float, float]], int, float]:
+    """
+    Parse FSM vfile_*.xyz; return (list of (s, E_rel), ts_node_1based, ts_energy_eV).
+    """
+    lines = vfile_path.read_text().strip().splitlines()
+    data: List[Tuple[float, float]] = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        try:
+            natoms = int(lines[i])
+        except ValueError:
+            i += 1
+            continue
+        i += 1
+        if i >= n:
+            break
+        parts = lines[i].split()
+        if len(parts) >= 2:
+            s = float(parts[0])
+            e = float(parts[1])
+            data.append((s, e))
+        i += 1 + natoms
+    if not data:
+        return [], 1, 0.0
+    ts_idx = max(range(len(data)), key=lambda j: data[j][1])
+    return data, ts_idx + 1, data[ts_idx][1]
+
+
+def run_fsm_calculation(args: argparse.Namespace) -> None:
+    """End-to-end FSM (Freezing String Method) MEP workflow for Zn2+ adsorption."""
     try:
         size, start_distance, end_distance = validate_inputs(args)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
-    
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    nprocs = 1 if args.no_mpi else args.nprocs
+    if args.no_mpi:
+        print("Running in serial mode (no MPI/parallel execution)")
+
+    orca_gen = OrcaInputGenerator(
+        method=args.method,
+        basis_set=args.basis,
+        solvent=args.solvent,
+        solvation_model=args.solvation,
+        memory=args.memory,
+        nprocs=nprocs,
+        scf_convergence=args.scf_convergence,
+        grid=f"DefGrid{args.grid}",
+    )
+    calc = NebCalculator(orca_generator=orca_gen)
+
+    # Prepare endpoint structures (writes initial.xyz, final.xyz to output_dir)
+    neb_images = args.neb_images if args.neb_images is not None else calculate_neb_images(start_distance, end_distance)
+    results = calc.prepare_neb_calculation(
+        num_carboxyl=args.carboxyl,
+        num_hydroxyl=args.hydroxyl,
+        surface_size=size,
+        start_distance=start_distance,
+        end_distance=end_distance,
+        neb_images=neb_images,
+        output_dir=output_dir,
+    )
+
+    chg = getattr(args, "chg", 2)
+    mult = getattr(args, "mult", 1)
+    fsm_reaction_dir = _prepare_fsm_reaction_dir(
+        output_dir,
+        output_dir / "initial.xyz",
+        output_dir / "final.xyz",
+        charge=chg,
+        multiplicity=mult,
+    )
+    print(f"\n--- FSM reaction directory prepared: {fsm_reaction_dir} ---")
+    print(f"  initial.xyz (two frames: reactant, product)")
+    print(f"  chg={chg}, mult={mult}")
+
+    orca_path = getattr(args, "orca_command", None)
+    if not orca_path:
+        _found, orca_path = check_orca_available()
+        if not _found:
+            orca_path = None
+    orca_available = orca_path is not None
+    if not orca_available:
+        print("\nORCA not found. FSM reaction files are ready; run FSM manually, e.g.:")
+        print(f"  python ML-FSM/examples/fsm_example.py {fsm_reaction_dir} --calculator orca --orca_command /path/to/orca ...")
+        _write_fsm_json(args, output_dir, fsm_reaction_dir, None, None, None)
+        return
+
+    orca_simple = getattr(args, "orca_simple", None) or f"{args.method} {args.basis} D3BJ CPCM({args.solvent})"
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    fsm_script = repo_root / "ML-FSM" / "examples" / "fsm_example.py"
+    if not fsm_script.exists():
+        print(f"\nFSM script not found: {fsm_script}")
+        _write_fsm_json(args, output_dir, fsm_reaction_dir, None, None, None)
+        return
+
+    cmd = [
+        sys.executable,
+        str(fsm_script),
+        str(fsm_reaction_dir),
+        "--calculator", "orca",
+        "--orca_command", orca_path,
+        "--orca_simple", orca_simple,
+        "--nt", str(nprocs),
+        "--chg", str(chg),
+        "--mult", str(mult),
+        "--nnodes_min", str(args.nnodes_min),
+        "--maxiter", str(args.fsm_maxiter),
+        "--maxls", str(args.fsm_maxls),
+    ]
+    if args.fsm_suffix:
+        cmd.extend(["--suffix", args.fsm_suffix])
+    if getattr(args, "verbose", False):
+        cmd.append("--verbose")
+
+    if not args.run_orca:
+        print("\nFSM reaction directory is ready. Run with --run-orca to execute FSM, e.g.:")
+        print("  " + " ".join(cmd))
+        _write_fsm_json(args, output_dir, fsm_reaction_dir, None, None, None)
+        return
+
+    print("\n--- Running FSM with ORCA ---")
+    print(f"  ORCA: {orca_path}")
+    print(f"  nnodes_min={args.nnodes_min}, maxiter={args.fsm_maxiter}, maxls={args.fsm_maxls}")
+    try:
+        result = subprocess.run(cmd, cwd=str(repo_root), check=False)
+        if result.returncode != 0:
+            print(f"\nFSM exited with code {result.returncode}. Check output above.")
+    except Exception as e:
+        print(f"\nError running FSM: {e}")
+        _write_fsm_json(args, output_dir, fsm_reaction_dir, None, None, None)
+        return
+
+    # Parse FSM output: find latest vfile in fsm_reaction/fsm_interp_*
+    fsm_out_dirs = sorted(fsm_reaction_dir.glob("fsm_interp_*"))
+    path_data = None
+    ts_node = None
+    ts_energy_eV = None
+    ngrad = None
+    latest_out = None
+    if fsm_out_dirs:
+        latest_out = fsm_out_dirs[-1]
+        vfiles = sorted(latest_out.glob("vfile_*.xyz"))
+        if vfiles:
+            path_data, ts_node, ts_energy_eV = _parse_fsm_vfile(vfiles[-1])
+        ngrad_file = latest_out / "ngrad.txt"
+        if ngrad_file.exists():
+            ngrad = int(ngrad_file.read_text().strip())
+
+    _write_fsm_json(args, output_dir, fsm_reaction_dir, path_data, ts_node, ts_energy_eV, ngrad)
+    _print_fsm_summary(path_data, ts_node, ts_energy_eV, ngrad)
+    # Auto-plot path if FSM output dir exists and plot script is available
+    if latest_out is not None and path_data:
+        _run_fsm_plot(repo_root, latest_out)
+    return
+
+
+def _write_fsm_json(
+    args: argparse.Namespace,
+    output_dir: Path,
+    fsm_reaction_dir: Path,
+    path_data: Optional[List[Tuple[float, float]]],
+    ts_node: Optional[int],
+    ts_energy_eV: Optional[float],
+    ngrad: Optional[int] = None,
+) -> None:
+    """Write JSON summary for FSM run."""
+    out = {
+        "path_method": "fsm",
+        "parameters": vars(args),
+        "fsm_reaction_dir": str(fsm_reaction_dir),
+        "path_energies": [{"s_Ang": s, "E_rel_eV": e} for (s, e) in (path_data or [])],
+        "ts_guess_node": ts_node,
+        "ts_guess_energy_eV": ts_energy_eV,
+        "ngrad": ngrad,
+    }
+    try:
+        with open(args.json_output, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\nResults saved to: {args.json_output}")
+    except Exception as e:
+        print(f"\nWarning: Could not save JSON: {e}")
+
+
+def _run_fsm_plot(repo_root: Path, fsm_out_dir: Path) -> None:
+    """Run plot_fsm_path.py on FSM output dir and save path.png (no-op if script missing)."""
+    plot_script = repo_root / "scripts" / "plot_fsm_path.py"
+    out_png = fsm_out_dir / "path.png"
+    if not plot_script.exists():
+        return
+    try:
+        subprocess.run(
+            [
+                sys.executable,
+                str(plot_script),
+                str(fsm_out_dir),
+                "-o",
+                str(out_png),
+                "--no-show",
+            ],
+            cwd=str(repo_root),
+            check=False,
+            capture_output=True,
+        )
+        if out_png.exists():
+            print(f"Path plot saved: {out_png}")
+    except Exception:
+        pass
+
+
+def _print_fsm_summary(
+    path_data: Optional[List[Tuple[float, float]]],
+    ts_node: Optional[int],
+    ts_energy_eV: Optional[float],
+    ngrad: Optional[int],
+) -> None:
+    """Print FSM summary to console."""
+    print("\n" + "=" * 50)
+    print("   FSM MEP SUMMARY")
+    print("=" * 50)
+    if path_data:
+        print(f"Path nodes: {len(path_data)}")
+        if ts_node is not None and ts_energy_eV is not None:
+            print(f"TS guess: node {ts_node}  E_rel = {ts_energy_eV:.4f} eV")
+        if ngrad is not None:
+            print(f"Gradient calls: {ngrad}")
+    else:
+        print("(No path data parsed; check FSM output directory.)")
+    print("=" * 50)
+
+
+def run_calculation(args: argparse.Namespace):
+    """Main MEP workflow: FSM (default) or NEB."""
+    if args.path_method == "fsm":
+        run_fsm_calculation(args)
+        return
+
+    try:
+        size, start_distance, end_distance = validate_inputs(args)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
     # Auto-calculate NEB images if not specified
     if args.neb_images is None:
         neb_images = calculate_neb_images(start_distance, end_distance)
