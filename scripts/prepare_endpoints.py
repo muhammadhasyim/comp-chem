@@ -10,6 +10,7 @@ Usage:
   python scripts/prepare_endpoints.py -o orca_inputs
   python scripts/prepare_endpoints.py --size 2x2 --start 5.0 --end 2.5 -o out/
   python scripts/prepare_endpoints.py --charge 2 --multiplicity 1 -o xyz/
+  python scripts/prepare_endpoints.py -o orca_inputs --auto-multiplicity  # closed-shell when possible
 
 Output:
   <output_dir>/initial.xyz   - reactant (Zn²⁺ at start_distance)
@@ -35,6 +36,25 @@ try:
     from zn2_adsorption.neb_calculator import NebCalculator
 except ImportError:
     NebCalculator = None
+
+try:
+    from pymatgen.core import Element
+except ImportError:
+    Element = None
+
+
+def closed_shell_multiplicity(symbols: list[str], charge: int) -> int:
+    """
+    Return multiplicity for closed-shell when possible (even electrons → 1, odd → 2).
+
+    Total electrons = sum(atomic numbers) - charge. Even → singlet, odd → doublet.
+    """
+    if Element is None:
+        raise RuntimeError("pymatgen is required for --auto-multiplicity. Install with: pip install pymatgen")
+    n_electrons = sum(Element(s).Z for s in symbols) - charge
+    if n_electrons < 0:
+        raise ValueError(f"Total electrons would be negative (charge={charge} too large for composition)")
+    return 1 if n_electrons % 2 == 0 else 2
 
 
 def write_xyz_with_charge(
@@ -74,12 +94,13 @@ def run(
     carboxyl: int = 0,
     hydroxyl: int = 0,
     charge: int = 2,
-    multiplicity: int = 1,
+    multiplicity: int | None = 1,
 ) -> int:
     """
     Prepare only initial.xyz and final.xyz in output_dir (no optimization).
 
-    Returns 0 on success, 1 on error (e.g. NebCalculator not available).
+    If multiplicity is None, it is set for closed-shell when possible (even
+    electrons → 1, odd electrons → 2). Returns 0 on success, 1 on error.
     """
     if NebCalculator is None:
         print("Error: zn2_adsorption is not installed. Install the package or run from repo root.", file=sys.stderr)
@@ -101,6 +122,14 @@ def run(
     positions_initial = [tuple(map(float, site.coords)) for site in initial_pmg]
     symbols_final = [site.specie.symbol for site in final_pmg]
     positions_final = [tuple(map(float, site.coords)) for site in final_pmg]
+
+    if multiplicity is None:
+        try:
+            multiplicity = closed_shell_multiplicity(symbols_initial, charge)
+        except (ValueError, RuntimeError) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        print(f"Auto multiplicity (closed-shell when possible): {multiplicity}")
 
     write_xyz_with_charge(
         output_dir / "initial.xyz",
@@ -184,7 +213,12 @@ def main() -> int:
         type=int,
         default=1,
         choices=(1, 2, 3, 4),
-        help="Spin multiplicity (default: 1)",
+        help="Spin multiplicity (default: 1). Ignored if --auto-multiplicity is set.",
+    )
+    parser.add_argument(
+        "--auto-multiplicity",
+        action="store_true",
+        help="Set multiplicity for closed-shell when possible (even electrons → 1, odd → 2).",
     )
     args = parser.parse_args()
 
@@ -194,6 +228,7 @@ def main() -> int:
     except Exception:
         parser.error("--size must be of the form NxM (e.g. 2x2, 4x4)")
 
+    multiplicity: int | None = None if args.auto_multiplicity else args.multiplicity
     return run(
         args.output_dir,
         size=size,
@@ -202,7 +237,7 @@ def main() -> int:
         carboxyl=args.carboxyl,
         hydroxyl=args.hydroxyl,
         charge=args.charge,
-        multiplicity=args.multiplicity,
+        multiplicity=multiplicity,
     )
 
 

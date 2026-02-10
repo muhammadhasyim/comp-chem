@@ -91,7 +91,12 @@ def main() -> int:
         type=int,
         default=1,
         choices=(1, 2, 3, 4),
-        help="Spin multiplicity (default: 1)",
+        help="Spin multiplicity (default: 1). Ignored if --auto-multiplicity is set.",
+    )
+    parser.add_argument(
+        "--auto-multiplicity",
+        action="store_true",
+        help="Set multiplicity for closed-shell when possible (even electrons → 1, odd → 2).",
     )
     args = parser.parse_args()
 
@@ -101,6 +106,7 @@ def main() -> int:
     except Exception:
         parser.error("--size must be of the form NxM (e.g. 2x2, 4x4)")
 
+    multiplicity: int | None = None if args.auto_multiplicity else args.multiplicity
     return prepare_run(
         args.output_dir,
         size=size,
@@ -109,7 +115,7 @@ def main() -> int:
         carboxyl=args.carboxyl,
         hydroxyl=args.hydroxyl,
         charge=args.charge,
-        multiplicity=args.multiplicity,
+        multiplicity=multiplicity,
     )
 
 
