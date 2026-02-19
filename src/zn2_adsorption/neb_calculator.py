@@ -8,6 +8,8 @@ This module handles the complete workflow for NEB calculations including:
 - Path analysis
 """
 
+from __future__ import annotations
+
 from typing import Optional, Dict, Tuple, List, Union
 from pathlib import Path
 import numpy as np
@@ -18,12 +20,14 @@ try:
     ASE_AVAILABLE = True
 except ImportError:
     ASE_AVAILABLE = False
+    Atoms = None  # type: ignore[misc, assignment]
 
 try:
     from pymatgen.core import Structure
     PYMATGEN_AVAILABLE = True
 except ImportError:
     PYMATGEN_AVAILABLE = False
+    Structure = None  # type: ignore[misc, assignment]
 
 from zn2_adsorption.orca_generator import OrcaInputGenerator
 from zn2_adsorption.surface_builder import FunctionalizedGrapheneBuilder

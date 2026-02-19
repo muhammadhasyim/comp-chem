@@ -6,6 +6,8 @@ for Zn2+ adsorption energy calculations, using pymatgen for periodic
 boundary conditions and adapting GOPY's functionalization logic.
 """
 
+from __future__ import annotations
+
 from typing import List, Tuple, Optional, Dict, Union
 import numpy as np
 import random

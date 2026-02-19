@@ -6,6 +6,8 @@ Structures, with support for implicit solvent models (CPCM, SMD) and
 distance constraints for geometry optimization.
 """
 
+from __future__ import annotations
+
 from typing import Optional, List, Dict, Union, Tuple
 from pathlib import Path
 import numpy as np
@@ -15,6 +17,7 @@ try:
     ASE_AVAILABLE = True
 except ImportError:
     ASE_AVAILABLE = False
+    Atoms = None  # type: ignore[misc, assignment]
 
 try:
     from pymatgen.core import Structure, Molecule
@@ -74,7 +77,7 @@ class OrcaInputGenerator:
         """
         Generate ORCA input from ASE Atoms object.
         """
-        if not ASE_AVAILABLE and isinstance(atoms, Atoms):
+        if not ASE_AVAILABLE:
             raise ImportError("ASE is required. Install with: pip install ase")
         
         command = self._build_command(calc_type)
