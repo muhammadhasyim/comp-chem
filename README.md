@@ -291,13 +291,22 @@ If `--neb-images` is not specified, the number of images is automatically calcul
 
 ## Project Structure
 
-- `src/zn2_adsorption/`: Core logic and modules.
-  - `surface_builder.py`: Hybrid pymatgen + GOPY logic for surface construction.
-  - `orca_generator.py`: ORCA input generation with constraints and NEB-TS support.
-  - `neb_calculator.py`: NEB workflow orchestration.
-  - `cli.py`: Command-line interface and validation.
-- `scripts/`: Executable scripts for users.
-- `tests/`: Unit and integration tests.
+```
+comp-chem/
+├── src/zn2_adsorption/     # Core package
+│   ├── surface_builder.py  # Hybrid pymatgen + GOPY logic for surface construction
+│   ├── orca_generator.py   # ORCA input generation (constraints, NEB-TS)
+│   ├── neb_calculator.py   # NEB workflow orchestration
+│   └── cli.py              # Command-line interface
+├── scripts/                # Executable scripts (see scripts/README.md)
+├── docs/                   # Documentation (see docs/README.md)
+│   ├── MEP_pipeline.md     # End-to-end MEP workflow
+│   ├── FSM_output_guide.md # FSM output format
+│   └── contributing/       # Commit and push guides
+├── tests/                  # Unit and integration tests
+├── notebooks/              # Jupyter notebooks
+└── external/               # External references (e.g. GOPY)
+```
 
 ## References
 
