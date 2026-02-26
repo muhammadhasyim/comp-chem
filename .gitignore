@@ -7,6 +7,9 @@ path.png
 nohup.out
 remote.out
 
+# ORCA output (large files)
+endpoints/
+
 # Results files (keep config files)
 *.json
 !pyproject.toml
