@@ -50,7 +50,7 @@ def test_create_initial_structure(neb_calculator):
     """Test creation of initial structure."""
     builder = neb_calculator.surface_builder
     pristine = builder.build_pristine_surface(supercell_size=(2, 2))
-    surface = builder.add_functional_groups(pristine, num_carboxyl=1, num_hydroxyl=0)
+    surface, _ = builder.add_functional_groups(pristine, num_carboxyl=1, num_hydroxyl=0)
     
     initial = neb_calculator.create_initial_structure(surface, distance=5.0)
     
@@ -71,7 +71,7 @@ def test_create_final_structure(neb_calculator):
     """Test creation of final structure."""
     builder = neb_calculator.surface_builder
     pristine = builder.build_pristine_surface(supercell_size=(2, 2))
-    surface = builder.add_functional_groups(pristine, num_carboxyl=1, num_hydroxyl=0)
+    surface, _ = builder.add_functional_groups(pristine, num_carboxyl=1, num_hydroxyl=0)
     
     final = neb_calculator.create_final_structure(surface, distance=2.5)
     
@@ -91,7 +91,7 @@ def test_ensure_atom_ordering(neb_calculator):
     """Test that atom ordering ensures Zn²⁺ is last."""
     builder = neb_calculator.surface_builder
     pristine = builder.build_pristine_surface(supercell_size=(2, 2))
-    surface = builder.add_functional_groups(pristine, num_carboxyl=1, num_hydroxyl=0)
+    surface, _ = builder.add_functional_groups(pristine, num_carboxyl=1, num_hydroxyl=0)
     
     # Add Zn²⁺ (should already be last, but test reordering anyway)
     structure_with_zn = builder.add_zn2_ion(surface, distance=3.0)
@@ -105,6 +105,23 @@ def test_ensure_atom_ordering(neb_calculator):
     
     # Check that all atoms are still present
     assert len(ordered) == len(structure_with_zn)
+
+
+def test_prepare_scan_base(neb_calculator):
+    """Test prepare_scan_base returns surface without Zn and metadata."""
+    base = neb_calculator.prepare_scan_base(
+        num_carboxyl=1,
+        num_hydroxyl=0,
+        surface_size=(2, 2),
+    )
+    assert "surface_structure" in base
+    assert "n_graphene" in base
+    assert "fg_bond_constraints" in base
+    # No Zn in surface
+    symbols = [s.specie.symbol for s in base["surface_structure"]]
+    assert "Zn" not in symbols
+    assert base["n_graphene"] > 0
+    assert isinstance(base["fg_bond_constraints"], list)
 
 
 def test_prepare_neb_calculation(neb_calculator, temp_dir):
@@ -139,6 +156,98 @@ def test_prepare_neb_calculation(neb_calculator, temp_dir):
     assert "NEB_END_XYZFILE" in neb_content
     assert "PREOPT_ENDS" in neb_content
     assert "TRUE" in neb_content or "true" in neb_content.lower()
+
+    # With constrain_endpoints=True (default): initial/final.inp should have Constraints
+    initial_content = (temp_dir / "initial.inp").read_text()
+    assert "Constraints" in initial_content
+    assert "{ C 0 C }" in initial_content  # Cartesian freeze for graphene carbons (0-based)
+    assert "{ B " in initial_content  # Bond constraint for Zn-surface distance
+
+
+def test_prepare_endpoints_only(neb_calculator, temp_dir):
+    """Test prepare_endpoints_only produces initial.inp and final.inp only (no neb.inp)."""
+    results = neb_calculator.prepare_endpoints_only(
+        num_carboxyl=1,
+        num_hydroxyl=0,
+        surface_size=(2, 2),
+        start_distance=5.0,
+        end_distance=2.5,
+        output_dir=temp_dir,
+    )
+    assert "initial_input" in results
+    assert "final_input" in results
+    assert "initial_xyz" in results
+    assert "final_xyz" in results
+    assert "neb_input" not in results
+
+    assert (temp_dir / "initial.inp").exists()
+    assert (temp_dir / "final.inp").exists()
+    assert (temp_dir / "initial.xyz").exists()
+    assert (temp_dir / "final.xyz").exists()
+    assert not (temp_dir / "neb.inp").exists()
+
+    # Constrained: surface + Zn frozen, FG-surface bonds fixed (1 carboxyl)
+    initial_content = (temp_dir / "initial.inp").read_text()
+    assert "Constraints" in initial_content
+    assert "{ C 0 C }" in initial_content
+    assert "{ B " in initial_content  # FG-surface bond constraint(s)
+
+
+def test_prepare_endpoints_only_uff_mode(neb_calculator, temp_dir):
+    """Test prepare_endpoints_only with generate_orca_inputs=False (UFF mode)."""
+    results = neb_calculator.prepare_endpoints_only(
+        num_carboxyl=0,
+        num_hydroxyl=0,
+        surface_size=(2, 2),
+        start_distance=5.0,
+        end_distance=2.5,
+        output_dir=temp_dir,
+        generate_orca_inputs=False,
+    )
+    assert "initial_xyz" in results
+    assert "final_xyz" in results
+    assert "initial_ase" in results
+    assert "final_ase" in results
+    assert "n_graphene" in results
+    assert "initial_input" not in results
+    assert "final_input" not in results
+
+    assert (temp_dir / "initial.xyz").exists()
+    assert (temp_dir / "final.xyz").exists()
+    assert not (temp_dir / "initial.inp").exists()
+    assert not (temp_dir / "final.inp").exists()
+
+
+def test_prepare_endpoints_only_unconstrained(neb_calculator, temp_dir):
+    """Test prepare_endpoints_only with constrain_endpoints=False."""
+    neb_calculator.prepare_endpoints_only(
+        num_carboxyl=0,
+        num_hydroxyl=0,
+        surface_size=(2, 2),
+        start_distance=5.0,
+        end_distance=2.5,
+        output_dir=temp_dir,
+        constrain_endpoints=False,
+    )
+    assert not (temp_dir / "neb.inp").exists()
+    initial_content = (temp_dir / "initial.inp").read_text()
+    assert "Constraints" not in initial_content
+
+
+def test_prepare_neb_calculation_unconstrained(neb_calculator, temp_dir):
+    """Test NEB preparation with constrain_endpoints=False."""
+    results = neb_calculator.prepare_neb_calculation(
+        num_carboxyl=1,
+        num_hydroxyl=0,
+        surface_size=(2, 2),
+        start_distance=5.0,
+        end_distance=2.5,
+        output_dir=temp_dir,
+        constrain_endpoints=False,
+    )
+    # Unconstrained: no %geom Constraints block in initial.inp
+    initial_content = (temp_dir / "initial.inp").read_text()
+    assert "Constraints" not in initial_content
 
 
 def test_calculate_multiplicity(neb_calculator):

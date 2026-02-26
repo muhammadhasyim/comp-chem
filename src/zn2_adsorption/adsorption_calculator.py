@@ -61,7 +61,7 @@ class AdsorptionEnergyCalculator:
             
         # 1. Build functionalized surface
         pristine = self.surface_builder.build_pristine_surface(supercell_size=surface_size)
-        surface_structure = self.surface_builder.add_functional_groups(
+        surface_structure, _ = self.surface_builder.add_functional_groups(
             pristine,
             num_carboxyl=num_carboxyl,
             num_hydroxyl=num_hydroxyl
@@ -90,9 +90,12 @@ class AdsorptionEnergyCalculator:
         surface_ase = self._pmg_to_ase(surface_structure)
         zn2_only_ase = Atoms(symbols=['Zn'], positions=[[0, 0, 0]])
         
-        # Zn2+@surface (charge +2)
-        self.orca_gen.charge = 2
-        self.orca_gen.multiplicity = self._calculate_multiplicity(zn2_surface_ase, charge=2)
+        # Zn2+@surface: charge = 2 - n_carboxyl (each carboxylate -1)
+        charge_complex = 2 - num_carboxyl
+        self.orca_gen.charge = charge_complex
+        self.orca_gen.multiplicity = self._calculate_multiplicity(
+            zn2_surface_ase, charge=charge_complex
+        )
         zn2_surface_input = self.orca_gen.generate_from_ase(
             zn2_surface_ase,
             calc_type="opt",
@@ -103,9 +106,12 @@ class AdsorptionEnergyCalculator:
             distance=actual_dist if constrain_distance else None
         )
         
-        # Surface only (charge 0)
-        self.orca_gen.charge = 0
-        self.orca_gen.multiplicity = self._calculate_multiplicity(surface_ase, charge=0)
+        # Surface only: charge = -n_carboxyl (carboxylates carry -1 each)
+        charge_surface = -num_carboxyl
+        self.orca_gen.charge = charge_surface
+        self.orca_gen.multiplicity = self._calculate_multiplicity(
+            surface_ase, charge=charge_surface
+        )
         surface_input = self.orca_gen.generate_from_ase(
             surface_ase,
             calc_type="opt",

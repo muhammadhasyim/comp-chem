@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 from zn2_adsorption.cli import parse_arguments, calculate_neb_images
 
 def test_parse_arguments_defaults():
@@ -116,6 +117,84 @@ def test_validate_inputs_invalid_distance():
     with pytest.raises(ValueError, match="Start and end distances must be different"):
         from zn2_adsorption.cli import validate_inputs
         validate_inputs(args)
+
+def test_cli_endpoints_only_uff(tmp_path):
+    """Test that --endpoints-only --calculator uff produces only xyz files (no .inp, no neb)."""
+    import subprocess
+    import sys
+
+    repo_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "zn2_adsorption.cli",
+            "--endpoints-only",
+            "--calculator",
+            "uff",
+            "--start-distance",
+            "5.0",
+            "--end-distance",
+            "2.5",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    assert result.returncode == 0, f"CLI failed: {result.stderr}"
+
+    assert (tmp_path / "initial.xyz").exists()
+    assert (tmp_path / "final.xyz").exists()
+    assert not (tmp_path / "initial.inp").exists()
+    assert not (tmp_path / "final.inp").exists()
+    assert not (tmp_path / "neb.inp").exists()
+
+
+def test_cli_endpoints_only_orca_produces_no_neb_inp(tmp_path):
+    """Test that --endpoints-only --calculator orca produces initial/final.inp but NOT neb.inp."""
+    import subprocess
+    import sys
+
+    repo_root = Path(__file__).resolve().parent.parent
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "zn2_adsorption.cli",
+            "--endpoints-only",
+            "--calculator",
+            "orca",
+            "--start-distance",
+            "5.0",
+            "--end-distance",
+            "2.5",
+            "--output-dir",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(repo_root),
+    )
+    assert result.returncode == 0, f"CLI failed: {result.stderr}"
+
+    assert (tmp_path / "initial.inp").exists()
+    assert (tmp_path / "final.inp").exists()
+    assert (tmp_path / "initial.xyz").exists()
+    assert (tmp_path / "final.xyz").exists()
+    assert not (tmp_path / "neb.inp").exists()
+
+
+def test_parse_arguments_endpoints_only():
+    """Test --endpoints-only flag is parsed."""
+    args = parse_arguments([
+        "--endpoints-only",
+        "--start-distance", "5.0",
+        "--end-distance", "2.5",
+    ])
+    assert args.endpoints_only is True
+
 
 def test_parse_arguments_no_mpi():
     """Test --no-mpi flag sets nprocs to 1."""

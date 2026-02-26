@@ -105,7 +105,7 @@ def run(
 
     calc = NebCalculator()
     pristine = calc.surface_builder.build_pristine_surface(supercell_size=size)
-    surface = calc.surface_builder.add_functional_groups(
+    surface, _ = calc.surface_builder.add_functional_groups(
         pristine,
         num_carboxyl=carboxyl,
         num_hydroxyl=hydroxyl,

@@ -1,7 +1,7 @@
 #!/bin/bash
-# Complete git setup and push script
+# Complete git setup and push script (run from repo root)
 
-cd /home/mh7373/GitRepos/comp-chem
+cd "$(dirname "$0")"
 
 echo "=== Step 1: Initialize Git ==="
 git init

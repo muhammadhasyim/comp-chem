@@ -24,8 +24,12 @@ dependencies = [
     "scipy>=1.10.0",
     "matplotlib>=3.7.0",
     "ccinput>=1.0.0",
-    "rdkit>=2022.9.5",
+    "rdkit>=2024.9.1",
 ]
+
+[project.optional-dependencies]
+uff = ["openbabel-wheel>=3.1.1"]
+rowan = ["rowan-python>=2.1.0", "stjames>=0.0.155"]
 
 [project.scripts]
 run-adsorption = "zn2_adsorption.cli:main"

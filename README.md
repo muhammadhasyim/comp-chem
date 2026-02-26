@@ -6,7 +6,7 @@ A command-line pipeline for minimum energy paths (MEP) of Zn²⁺ adsorbing on f
 
 This tool automates the workflow for finding MEPs and transition states for Zn²⁺ adsorption on functionalized graphene surfaces. **By default** it uses the **Freezing String Method (FSM)** via the [ML-FSM](https://github.com/thegomeslab/ML-FSM) submodule with ORCA; use `--path-method neb` for the classic NEB-TS workflow. The pipeline uses a hybrid approach:
 - **pymatgen**: Provides periodic boundary conditions to eliminate edge effects.
-- **GOPY Logic**: Implements reliable functionalization patterns for carboxyl (-COOH) and hydroxyl (-OH) groups.
+- **GOPY Logic**: Implements reliable functionalization patterns for carboxylate (-COO⁻) and hydroxyl (-OH) groups.
 - **ORCA**: Generates NEB-TS input files with constrained endpoint optimizations.
 
 ## Installation
@@ -38,6 +38,12 @@ This will install:
 - `numpy`, `scipy` - Numerical computing
 - `matplotlib` - Plotting (optional)
 - `rdkit` - Molecular chemistry toolkit
+
+**For UFF endpoints-only mode** (fast geometry optimization), also install Open Babel:
+```bash
+pip install openbabel-wheel
+# or: pip install zn2-adsorption[uff]
+```
 
 ### Step 3: Verify Installation
 
@@ -93,9 +99,29 @@ If you want to run calculations automatically (not just generate input files):
 
 The tool provides a command-line interface `run-adsorption` for NEB calculations.
 
-### Basic Usage: Generate Input Files Only
+### Endpoints-Only Workflow (Quick, No Pathway)
 
-Generate ORCA input files without running calculations:
+For fast geometry optimization, use the endpoints-only workflow. By default it uses **UFF** (Universal Force Field) via Open Babel—runs in seconds instead of hours:
+
+```bash
+pip install openbabel-wheel   # Required for UFF mode
+run-adsorption --endpoints-only --start-distance 5 --end-distance 2.5 -O endpoints/
+run-adsorption --endpoints-only --start-distance 5 --end-distance 2.5 -O endpoints/ --run-orca
+```
+
+**UFF mode (default)** creates:
+- `initial.xyz` / `final.xyz` - Structure files (optimized when `--run-orca` is used)
+- No `.inp` files—optimization runs in-process via Open Babel
+
+**ORCA mode** (use `--calculator orca` for DFT):
+- `initial.inp` / `final.inp` - ORCA input files
+- `initial.xyz` / `final.xyz` - Structure files
+
+No `neb.inp` is generated. Ideal for quick geometry optimization to relieve steric hindrance of functional groups without computing the full energy pathway.
+
+### Basic Usage: Generate Input Files Only (Full MEP)
+
+Generate ORCA input files for the full MEP workflow (NEB or FSM):
 
 ```bash
 run-adsorption \
@@ -240,20 +266,25 @@ If you prefer to run ORCA manually:
 | `--scf-convergence` | | SCF convergence criteria ('TightSCF', 'NormalSCF', 'LooseSCF') | 'TightSCF' |
 | `--grid` | | Integration grid quality (1-7, higher is better but slower) | 4 |
 | `--output-dir` | `-O` | Directory for ORCA files | './orca_inputs' |
+| `--endpoints-only` | | Generate only initial and final endpoint structures (no NEB/FSM pathway). Uses UFF by default for fast optimization. | False |
+| `--calculator` | | [Endpoints-only] Calculator: `uff` (fast, in-process) or `orca` (DFT). | uff |
 | `--run-orca` | | Attempt to run ORCA if available | False |
 | `--skip-endpoint-opt` | | Skip pre-optimization of endpoints (PREOPT_ENDS will handle it). Faster but may converge slower. | False |
+| `--no-constrain-endpoints` | | Disable constrained endpoint optimization. By default, the carbon surface is frozen and Zn-surface distance is fixed while functional groups relax (avoids steric hindrance). | False |
 | `--json-output` | | Path for results JSON file | './neb_results.json' |
+| `--plot` | | Plot NEB energy profile (saves `path.png` in output dir when UFF NEB completes) | False |
 
 ## Workflow
 
 The NEB calculation proceeds in three main steps (unless `--skip-endpoint-opt` is used):
 
-1. **Pre-optimize initial endpoint** (optional, skipped with `--skip-endpoint-opt`): Unconstrained geometry optimization starting from Zn²⁺ at `--start-distance`
+1. **Pre-optimize initial endpoint** (optional, skipped with `--skip-endpoint-opt`): Constrained geometry optimization starting from Zn²⁺ at `--start-distance`
+   - Carbon surface frozen; Zn-surface distance fixed; functional groups relaxed (use `--no-constrain-endpoints` to disable)
    - Generates `initial.inp` and runs optimization
    - Extracts optimized geometry to `initial.xyz`
    - Energy saved to results
 
-2. **Pre-optimize final endpoint** (optional, skipped with `--skip-endpoint-opt`): Unconstrained geometry optimization starting from Zn²⁺ at `--end-distance`
+2. **Pre-optimize final endpoint** (optional, skipped with `--skip-endpoint-opt`): Same constraints as initial endpoint
    - Generates `final.inp` and runs optimization
    - Extracts optimized geometry to `final.xyz`
    - Energy saved to results
@@ -266,8 +297,8 @@ The NEB calculation proceeds in three main steps (unless `--skip-endpoint-opt` i
 
 **Note**: 
 - By default, endpoints are pre-optimized separately for better starting geometries and separate energy values.
+- Endpoint optimizations use constraints by default: carbon surface atoms are frozen, Zn-surface distance is fixed, and functional groups (OH, COOH) are flexible—this avoids steric hindrance while keeping the reaction coordinate consistent. Use `--no-constrain-endpoints` for fully unconstrained optimization.
 - With `--skip-endpoint-opt`, ORCA's `PREOPT_ENDS TRUE` keyword will optimize endpoints during the NEB calculation itself, saving computation time but potentially requiring more NEB iterations.
-- The endpoint optimizations are unconstrained (no distance constraints).
 
 ## Output Files
 

@@ -1,9 +1,11 @@
 import argparse
-import sys
-import os
+import copy
 import json
+import os
 import shutil
 import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional, Tuple, Dict, Any
 from pathlib import Path
 
@@ -39,7 +41,7 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         "--carboxyl", "-c",
         type=int,
         default=0,
-        help="Number of carboxyl (-COOH) groups (default: 0)"
+        help="Number of carboxylate (-COO⁻) groups (default: 0)"
     )
     parser.add_argument(
         "--hydroxyl", "-y",
@@ -135,8 +137,8 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
     parser.add_argument(
         "--chg",
         type=int,
-        default=2,
-        help="Total charge (default: 2 for Zn²⁺@surface)"
+        default=None,
+        help="Total charge. If omitted: 2 - n_carboxyl (Zn²⁺ + carboxylate -1 each)"
     )
     parser.add_argument(
         "--mult",
@@ -163,13 +165,70 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         help="Verbose output (passed to FSM when --path-method fsm)"
     )
     
-    # Path method: NEB or FSM (Freezing String Method)
+    # Endpoints-only mode (no pathway)
+    parser.add_argument(
+        "--endpoints-only",
+        action="store_true",
+        default=False,
+        help="Generate and optionally run only initial and final endpoint optimizations (no NEB/FSM pathway). Uses UFF by default for fast runs."
+    )
+    parser.add_argument(
+        "--calculator",
+        type=str,
+        default="uff",
+        choices=["uff", "orca", "rowan"],
+        help="Calculator: 'uff' (fast), 'orca' (DFT), or 'rowan' (cloud NNP). Default: uff."
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default="uma_s_omol",
+        help="[Rowan] Neural network potential model. Examples: "
+             "uma_s_omol (UMA Small OMol25, default), uma_m_omol (UMA Medium), "
+             "uma_s_omat, uma_m_omat, uma_s_omc, uma_m_omc, "
+             "mace_mp_0, mace_mp_0b2_l, aimnet2_wb97md3, "
+             "orb_v3_conservative_omol, orb_v3_conservative_inf_omat, "
+             "omol25_conserving_s, egret_1, egret_1e, egret_1t, "
+             "gfn2_xtb, gfn1_xtb, gfn0_xtb, gfn_ff, g_xtb.",
+    )
+    # Path method: NEB, FSM, or distance scan
     parser.add_argument(
         "--path-method",
         type=str,
         default="fsm",
-        choices=["neb", "fsm"],
-        help="MEP method: 'fsm' (Freezing String) or 'neb' (Nudged Elastic Band) (default: 'fsm')"
+        choices=["neb", "fsm", "scan"],
+        help="Method: 'fsm' (Freezing String), 'neb' (Nudged Elastic Band), or 'scan' (distance scan) (default: 'fsm')"
+    )
+    # Scan-specific options (used when --path-method scan)
+    parser.add_argument(
+        "--scan-points",
+        type=int,
+        default=None,
+        help="[SCAN] Number of distances to sample (default: auto from step 0.5 Å)"
+    )
+    parser.add_argument(
+        "--scan-step",
+        type=float,
+        default=None,
+        help="[SCAN] Step size in Angstrom; overrides --scan-points if set"
+    )
+    parser.add_argument(
+        "--fg-sweep",
+        action="store_true",
+        default=False,
+        help="[SCAN] Sweep over (carboxyl, hydroxyl) combinations from (0,0) to max; overrides --carboxyl and --hydroxyl",
+    )
+    parser.add_argument(
+        "--fg-sweep-max-carboxyl",
+        type=int,
+        default=2,
+        help="[SCAN] Max carboxylate count when --fg-sweep (default: 2)",
+    )
+    parser.add_argument(
+        "--fg-sweep-max-hydroxyl",
+        type=int,
+        default=2,
+        help="[SCAN] Max hydroxyl count when --fg-sweep (default: 2)",
     )
     # FSM-specific options (used when --path-method fsm)
     parser.add_argument(
@@ -206,10 +265,16 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         help="Output directory for ORCA/FSM files; fsm_reaction is created under DIR (default: './orca_inputs')"
     )
     parser.add_argument(
+        "--run",
+        action="store_true",
+        default=False,
+        help="Run optimization (UFF when --calculator uff, ORCA when --calculator orca). Default: False."
+    )
+    parser.add_argument(
         "--run-orca",
         action="store_true",
         default=False,
-        help="Attempt to run ORCA if available (default: False)"
+        help="(Alias for --run) Run the calculation. Kept for backward compatibility."
     )
     parser.add_argument(
         "--skip-endpoint-opt",
@@ -218,13 +283,42 @@ def parse_arguments(args: List[str]) -> argparse.Namespace:
         help="[NEB] Skip pre-optimization of endpoints (let PREOPT_ENDS handle it in NEB). Faster but may converge slower. (default: False)"
     )
     parser.add_argument(
+        "--no-constrain-endpoints",
+        action="store_true",
+        default=False,
+        help="[NEB] Disable constrained endpoint optimization (freeze surface + fix Zn distance). By default, carbon surface is frozen and Zn-surface distance fixed while functional groups relax to avoid steric hindrance."
+    )
+    parser.add_argument(
+        "--relax-surface",
+        action="store_true",
+        default=False,
+        help="[Rowan scan] Allow graphene surface to relax during scan. "
+             "Default: surface frozen. Angle constraints still enforce "
+             "perpendicular Zn approach.",
+    )
+    parser.add_argument(
+        "--freeze-functional-groups",
+        action="store_true",
+        default=False,
+        help="[Scan] Fully freeze functional groups (no motion). "
+             "Default: C-FG bonds constrained; FGs can flex/rotate.",
+    )
+    parser.add_argument(
         "--json-output",
         type=str,
         default="./mep_results.json",
         help="JSON output file path (default: './mep_results.json')"
     )
+    parser.add_argument(
+        "--plot",
+        action="store_true",
+        default=False,
+        help="Plot NEB energy profile (saves path.png in output dir when NEB completes)"
+    )
     
-    return parser.parse_args(args)
+    parsed = parser.parse_args(args)
+    parsed.run_orca = parsed.run_orca or parsed.run
+    return parsed
 
 def validate_inputs(args: argparse.Namespace) -> Tuple[Tuple[int, int], float, float]:
     """
@@ -771,9 +865,12 @@ def run_fsm_calculation(args: argparse.Namespace) -> None:
         end_distance=end_distance,
         neb_images=neb_images,
         output_dir=output_dir,
+        constrain_endpoints=not getattr(args, "no_constrain_endpoints", False),
     )
 
-    chg = getattr(args, "chg", 2)
+    chg = getattr(args, "chg", None)
+    if chg is None:
+        chg = 2 - getattr(args, "carboxyl", 0)
     mult = getattr(args, "mult", 1)
     fsm_reaction_dir = _prepare_fsm_reaction_dir(
         output_dir,
@@ -826,7 +923,7 @@ def run_fsm_calculation(args: argparse.Namespace) -> None:
         cmd.append("--verbose")
 
     if not args.run_orca:
-        print("\nFSM reaction directory is ready. Run with --run-orca to execute FSM, e.g.:")
+        print("\nFSM reaction directory is ready. Run with --run to execute FSM, e.g.:")
         print("  " + " ".join(cmd))
         _write_fsm_json(args, output_dir, fsm_reaction_dir, None, None, None)
         return
@@ -941,12 +1038,741 @@ def _print_fsm_summary(
     print("=" * 50)
 
 
+def _run_neb_uff(args: argparse.Namespace) -> None:
+    """NEB workflow using UFF (in-process, fast)."""
+    from ase.io import write
+    from zn2_adsorption.neb_runner import run_neb_uff
+    from zn2_adsorption.uff_optimizer import optimize_with_uff
+
+    try:
+        size, start_distance, end_distance = validate_inputs(args)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    neb_images = (
+        args.neb_images
+        if args.neb_images is not None
+        else calculate_neb_images(start_distance, end_distance)
+    )
+    if args.neb_images is None:
+        print(f"Auto-calculated NEB images: {neb_images}")
+
+    print("--- Preparing NEB Calculation (UFF) ---")
+    print(f"Surface size: {size[0]}x{size[1]}")
+    print(f"Functional groups: {args.carboxyl} carboxylate, {args.hydroxyl} hydroxyl")
+    print(f"Zn2+ start distance: {start_distance} Angstroms")
+    print(f"Zn2+ end distance: {end_distance} Angstroms")
+    print(f"NEB images: {neb_images}")
+    print("Calculator: UFF (Universal Force Field, fast)")
+
+    calc = NebCalculator()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    constrain = not getattr(args, "no_constrain_endpoints", False)
+
+    results = calc.prepare_endpoints_only(
+        num_carboxyl=args.carboxyl,
+        num_hydroxyl=args.hydroxyl,
+        surface_size=size,
+        start_distance=start_distance,
+        end_distance=end_distance,
+        output_dir=output_dir,
+        constrain_endpoints=constrain,
+        generate_orca_inputs=False,
+    )
+
+    initial_ase = results["initial_ase"]
+    final_ase = results["final_ase"]
+    freeze = results["freeze_atoms"] or []
+    fg_bonds = results.get("fg_bond_constraints") or []
+
+    if args.run_orca:
+        print("\n--- Step 1: UFF optimization (initial endpoint) ---")
+        if constrain:
+            print("  (constrained: surface + Zn frozen, FG-surface bonds fixed)")
+        try:
+            if optimize_with_uff(
+                initial_ase,
+                freeze_indices=freeze,
+                bond_constraints=fg_bonds,
+            ):
+                write(output_dir / "initial.xyz", initial_ase, format="xyz")
+                print("  Updated initial.xyz")
+            else:
+                print("  Warning: UFF endpoint optimization failed")
+        except ImportError as e:
+            print(f"  Error: {e}")
+            sys.exit(1)
+
+        print("\n--- Step 2: UFF optimization (final endpoint) ---")
+        try:
+            if optimize_with_uff(
+                final_ase,
+                freeze_indices=freeze,
+                bond_constraints=fg_bonds,
+            ):
+                write(output_dir / "final.xyz", final_ase, format="xyz")
+                print("  Updated final.xyz")
+            else:
+                print("  Warning: UFF endpoint optimization failed")
+        except ImportError as e:
+            print(f"  Error: {e}")
+            sys.exit(1)
+
+        print("\n--- Step 3: Running NEB (UFF) ---")
+        try:
+            neb_result = run_neb_uff(
+                initial_ase,
+                final_ase,
+                n_images=neb_images,
+                freeze_indices=freeze,
+                fg_bond_constraints=fg_bonds,
+                interpolation="idpp",
+                fmax=0.05,
+                max_steps=200,
+                output_dir=output_dir,
+            )
+        except ImportError as e:
+            print(f"  Error: {e}")
+            sys.exit(1)
+
+        energies = neb_result["energies"]
+        ts_idx = neb_result["ts_index"]
+        converged = neb_result["converged"]
+
+        EV_TO_KCAL = 23.0609
+        e_init = energies[0]
+        e_final = energies[-1]
+        e_ts = energies[ts_idx]
+        barrier = (e_ts - e_init) * EV_TO_KCAL if e_init is not None else None
+        reaction = (e_final - e_init) * EV_TO_KCAL if e_init is not None else None
+
+        print(f"  Converged: {converged}")
+        print(f"  E(initial): {e_init:.4f} eV")
+        print(f"  E(final):   {e_final:.4f} eV")
+        print(f"  E(TS):      {e_ts:.4f} eV (image {ts_idx})")
+        if barrier is not None:
+            print(f"  Barrier:    {barrier:.2f} kcal/mol")
+        if reaction is not None:
+            print(f"  Reaction:   {reaction:.2f} kcal/mol")
+
+        print("\n" + "=" * 50)
+        print("   NEB (UFF) SUMMARY")
+        print("=" * 50)
+        print(f"  Path images written to {output_dir}/neb_*.xyz")
+        print("  (UFF energies are qualitative; use ORCA for DFT accuracy)")
+        print("=" * 50)
+
+        if getattr(args, "plot", False):
+            try:
+                from zn2_adsorption.plotting import plot_neb_energy_profile
+                plot_path = output_dir / "path.png"
+                plot_neb_energy_profile(energies, ts_idx, plot_path, title="NEB (UFF) Energy Profile")
+                print(f"\n  Energy profile plot saved: {plot_path}")
+            except ImportError as e:
+                print(f"\n  Warning: Could not plot ({e})")
+            except Exception as e:
+                print(f"\n  Warning: Plot failed: {e}")
+
+        output_data = {
+            "parameters": {k: v for k, v in vars(args).items() if isinstance(v, (str, int, float, bool, type(None)))},
+            "calculator": "uff",
+            "neb_run": True,
+            "neb_converged": bool(converged),
+            "neb_images": neb_images,
+            "ts_index": int(ts_idx),
+            "energies_eV": [float(e) for e in energies],
+            "barrier_height_kcal_mol": float(barrier) if barrier is not None else None,
+            "reaction_energy_kcal_mol": float(reaction) if reaction is not None else None,
+        }
+    else:
+        print("\nFiles generated in:", args.output_dir)
+        print("  - initial.xyz, final.xyz")
+        print("\nTo run UFF NEB:")
+        print(
+            f"  run-adsorption --path-method neb --calculator uff "
+            f"--start-distance {args.start_distance} --end-distance {args.end_distance} "
+            f"--run -O {args.output_dir}"
+        )
+        output_data = {
+            "parameters": dict(vars(args)),
+            "calculator": "uff",
+            "neb_run": False,
+        }
+
+    try:
+        with open(args.json_output, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"\nResults summary saved to: {args.json_output}")
+    except Exception as e:
+        print(f"\nWarning: Could not save JSON output: {e}")
+
+
+def _run_scan_uff(args: argparse.Namespace) -> None:
+    """Distance scan workflow: optimize FGs at each Zn-surface distance (UFF)."""
+    import numpy as np
+
+    from zn2_adsorption.neb_calculator import NebCalculator
+    from zn2_adsorption.scan_runner import run_distance_scan_uff
+
+    try:
+        size, start_distance, end_distance = validate_inputs(args)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    scan_points = getattr(args, "scan_points", None)
+    scan_step = getattr(args, "scan_step", None)
+    if scan_step is not None:
+        n = max(2, int(np.round((start_distance - end_distance) / scan_step)) + 1)
+        distances = list(np.linspace(start_distance, end_distance, n))
+    elif scan_points is not None:
+        distances = list(np.linspace(start_distance, end_distance, scan_points))
+    else:
+        n = max(2, int(np.round((start_distance - end_distance) / 0.5)) + 1)
+        distances = list(np.linspace(start_distance, end_distance, n))
+
+    freeze_fg = getattr(args, "freeze_functional_groups", False)
+    fg_mode = "FGs frozen" if freeze_fg else "C-FG bonds constrained, FGs flex"
+    print("--- Preparing Distance Scan (UFF) ---")
+    print(f"Surface size: {size[0]}x{size[1]}")
+    print(f"Functional groups: {args.carboxyl} carboxylate, {args.hydroxyl} hydroxyl")
+    print(f"Zn2+ distance range: {start_distance} to {end_distance} Angstroms")
+    print(f"Scan points: {len(distances)}")
+    print(f"Calculator: UFF (constrained: surface + Zn fixed, {fg_mode})")
+
+    calc = NebCalculator()
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    base = calc.prepare_scan_base(
+        num_carboxyl=args.carboxyl,
+        num_hydroxyl=args.hydroxyl,
+        surface_size=size,
+    )
+
+    if not args.run_orca:
+        print("\nFiles will be generated when --run is used.")
+        print(
+            f"  run-adsorption --path-method scan --calculator uff "
+            f"--start-distance {args.start_distance} --end-distance {args.end_distance} "
+            f"--scan-points {len(distances)} --run -O {args.output_dir}"
+        )
+        output_data = {
+            "path_method": "scan",
+            "parameters": dict(vars(args)),
+            "calculator": "uff",
+            "scan_run": False,
+            "distances": distances,
+            "energies": None,
+        }
+        try:
+            with open(args.json_output, "w") as f:
+                json.dump(output_data, f, indent=2)
+            print(f"\nResults summary saved to: {args.json_output}")
+        except Exception as e:
+            print(f"\nWarning: Could not save JSON output: {e}")
+        return
+
+    print("\n--- Running distance scan ---")
+    result = run_distance_scan_uff(
+        surface_structure=base["surface_structure"],
+        n_graphene=base["n_graphene"],
+        fg_bond_constraints=base["fg_bond_constraints"],
+        distances=distances,
+        surface_builder=calc.surface_builder,
+        neb_calculator=calc,
+        freeze_functional_groups=freeze_fg,
+        output_dir=output_dir,
+        verbose=True,
+        save_geometries=True,
+    )
+
+    distances_out = result["distances"]
+    energies_out = result["energies"]
+
+    print("\n==================================================")
+    print("   DISTANCE SCAN (UFF) SUMMARY")
+    print("==================================================")
+    valid = [e for e in energies_out if e == e]
+    if valid:
+        print(f"  E(min): {min(valid):.4f} eV  E(max): {max(valid):.4f} eV")
+        print(f"  Optimized geometries written to {output_dir}/scan_*.xyz")
+    print("==================================================")
+
+    if args.plot:
+        plot_path = output_dir / "path.png"
+        try:
+            from zn2_adsorption.plotting import plot_scan_profile
+            plot_scan_profile(distances_out, energies_out, plot_path, title="Distance Scan (UFF)")
+            print(f"\n  Energy profile plot saved: {plot_path}")
+        except ImportError as e:
+            print(f"\n  Could not generate plot: {e}")
+
+    output_data = {
+        "path_method": "scan",
+        "parameters": dict(vars(args)),
+        "calculator": "uff",
+        "scan_run": True,
+        "distances": [float(d) for d in distances_out],
+        "energies": [float(e) if e == e else None for e in energies_out],
+    }
+    try:
+        with open(args.json_output, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"\nResults summary saved to: {args.json_output}")
+    except Exception as e:
+        print(f"\nWarning: Could not save JSON output: {e}")
+
+
+def _run_scan_fg_sweep(args: argparse.Namespace, calculator: str) -> None:
+    """Run scans over all (carboxyl, hydroxyl) combinations from (0,0) to max.
+
+    Submits all combinations in parallel (Rowan) or runs them in parallel (UFF).
+    """
+    base_dir = Path(args.output_dir)
+    max_c = getattr(args, "fg_sweep_max_carboxyl", 2)
+    max_y = getattr(args, "fg_sweep_max_hydroxyl", 2)
+    combos = [(c, y) for c in range(max_c + 1) for y in range(max_y + 1)]
+    n_combos = len(combos)
+    print(f"\n--- FG SWEEP: {n_combos} combinations (carboxyl 0–{max_c}, hydroxyl 0–{max_y}), parallel ---")
+
+    def _run_one(c: int, y: int) -> None:
+        subdir = base_dir / f"carboxyl_{c}_hydroxyl_{y}"
+        subdir.mkdir(parents=True, exist_ok=True)
+        sweep_args = copy.deepcopy(args)
+        sweep_args.carboxyl = c
+        sweep_args.hydroxyl = y
+        sweep_args.output_dir = str(subdir)
+        sweep_args.json_output = str(subdir / "scan_results.json")
+        if calculator == "rowan":
+            _run_scan_rowan(sweep_args)
+        else:
+            _run_scan_uff(sweep_args)
+
+    max_workers = min(n_combos, 9)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_run_one, c, y): (c, y) for c, y in combos}
+        for future in as_completed(futures):
+            c, y = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                print(f"\n  ERROR (carboxyl={c}, hydroxyl={y}): {exc}")
+
+
+def _run_scan_rowan(args: argparse.Namespace) -> None:
+    """Distance scan workflow via Rowan cloud (UMA Small).
+
+    Targets the central carbon away from functional groups (single site).
+    """
+    import numpy as np
+
+    from zn2_adsorption.neb_calculator import NebCalculator
+    from zn2_adsorption.rowan_scan_runner import run_hexagon_scans_rowan, _resolve_method
+
+    try:
+        size, start_distance, end_distance = validate_inputs(args)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    scan_points = getattr(args, "scan_points", None)
+    scan_step = getattr(args, "scan_step", None)
+    if scan_step is not None:
+        n = max(2, int(np.round((start_distance - end_distance) / scan_step)) + 1)
+        distances = list(np.linspace(start_distance, end_distance, n))
+    elif scan_points is not None:
+        distances = list(np.linspace(start_distance, end_distance, scan_points))
+    else:
+        n = max(2, int(np.round((start_distance - end_distance) / 0.5)) + 1)
+        distances = list(np.linspace(start_distance, end_distance, n))
+
+    charge = getattr(args, "chg", None)
+    if charge is None:
+        charge = 2 - getattr(args, "carboxyl", 0)
+    multiplicity = getattr(args, "mult", 1)
+    freeze_surface = not getattr(args, "relax_surface", False)
+    freeze_functional_groups = getattr(args, "freeze_functional_groups", False)
+
+    model_name = getattr(args, "model", "uma_s_omol")
+    try:
+        resolved_method = _resolve_method(model_name)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    surface_mode = "surface frozen" if freeze_surface else "surface relaxed"
+    fg_mode = "FGs frozen" if freeze_functional_groups else "C-FG bonds constrained, FGs flex"
+    print(f"--- Preparing Distance Scan (Rowan / {resolved_method.name}) ---")
+    print(f"Surface size: {size[0]}x{size[1]}")
+    print(f"Functional groups: {args.carboxyl} carboxylate, {args.hydroxyl} hydroxyl")
+    print(f"Zn2+ distance range: {start_distance} to {end_distance} Angstroms")
+    print(f"Scan points per site: {len(distances)}")
+    print(f"Calculator: Rowan ({resolved_method.name}, central site away from FGs, {surface_mode}, {fg_mode}, perpendicular approach)")
+
+    try:
+        calc = NebCalculator()
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        base = calc.prepare_scan_base(
+            num_carboxyl=args.carboxyl,
+            num_hydroxyl=args.hydroxyl,
+            surface_size=size,
+        )
+
+        if not args.run_orca:
+            print("\nRowan scan requires --run to execute. Use --run to submit to Rowan cloud.")
+            print(
+                f"  run-adsorption --path-method scan --calculator rowan "
+                f"--start-distance {args.start_distance} --end-distance {args.end_distance} "
+                f"--scan-points {len(distances)} --run -O {args.output_dir}"
+            )
+            return
+
+        print(f"\n--- Running central-site scan on Rowan ({resolved_method.name}) ---")
+        result = run_hexagon_scans_rowan(
+            surface_structure=base["surface_structure"],
+            n_graphene=base["n_graphene"],
+            fg_bond_constraints=base["fg_bond_constraints"],
+            distances=distances,
+            neb_calculator=calc,
+            charge=charge,
+            multiplicity=multiplicity,
+            output_dir=output_dir,
+            verbose=True,
+            freeze_surface=freeze_surface,
+            freeze_functional_groups=freeze_functional_groups,
+            method=resolved_method,
+        )
+
+        print("\n==================================================")
+        print(f"   CENTRAL-SITE SCAN (Rowan {resolved_method.name}) SUMMARY")
+        print("==================================================")
+        for site in result.get("sites", []):
+            c_label = f"C{site['target_c_idx'] + 1}"
+            energies = site.get("energies", [])
+            valid = [e for e in energies if e == e]
+            if valid:
+                print(f"  {c_label}: E(min)={min(valid):.4f} eV  E(max)={max(valid):.4f} eV")
+            else:
+                err = site.get("error", "no energies")
+                print(f"  {c_label}: {err}")
+            url = site.get("workflow_url", "N/A")
+            print(f"         {url}")
+        print("==================================================")
+
+        output_data = {
+            "path_method": "scan",
+            "parameters": dict(vars(args)),
+            "calculator": "rowan",
+            "scan_run": True,
+            "hexagon_indices": result.get("hexagon_indices"),
+            "sites": result.get("sites"),
+        }
+        try:
+            with open(args.json_output, "w") as f:
+                json.dump(output_data, f, indent=2, default=str)
+            print(f"\nResults summary saved to: {args.json_output}")
+        except Exception as e:
+            print(f"\nWarning: Could not save JSON output: {e}")
+
+    except ImportError as e:
+        print(f"Error: {e}")
+        print("Install Rowan support: pip install zn2-adsorption[rowan]")
+        sys.exit(1)
+    except RuntimeError as e:
+        if "API key" in str(e):
+            print(f"Error: {e}")
+            print("Set ROWAN_API_KEY or rowan.api_key before running.")
+            sys.exit(1)
+        raise
+
+
+def _run_endpoints_only_uff(args: argparse.Namespace) -> None:
+    """Endpoints-only workflow using UFF (fast, in-process)."""
+    from ase.io import write
+    from zn2_adsorption.uff_optimizer import optimize_with_uff
+
+    try:
+        size, start_distance, end_distance = validate_inputs(args)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    print("--- Preparing Endpoints-Only Calculation (UFF) ---")
+    print(f"Surface size: {size[0]}x{size[1]}")
+    print(f"Functional groups: {args.carboxyl} carboxylate, {args.hydroxyl} hydroxyl")
+    print(f"Zn2+ start distance: {start_distance} Angstroms")
+    print(f"Zn2+ end distance: {end_distance} Angstroms")
+    print("Calculator: UFF (Universal Force Field, fast)")
+
+    calc = NebCalculator()
+    output_dir = Path(args.output_dir)
+    constrain = not getattr(args, "no_constrain_endpoints", False)
+
+    results = calc.prepare_endpoints_only(
+        num_carboxyl=args.carboxyl,
+        num_hydroxyl=args.hydroxyl,
+        surface_size=size,
+        start_distance=start_distance,
+        end_distance=end_distance,
+        output_dir=output_dir,
+        constrain_endpoints=constrain,
+        generate_orca_inputs=False,
+    )
+
+    print(f"\nFiles generated in: {args.output_dir}")
+    print(f"  - initial.xyz (initial structure)")
+    print(f"  - final.xyz (final structure)")
+
+    output_data = {
+        "parameters": dict(vars(args)),
+        "calculator": "uff",
+        "files": {
+            "initial_xyz": str(output_dir / "initial.xyz"),
+            "final_xyz": str(output_dir / "final.xyz"),
+        },
+        "optimization_run": False,
+        "energies": {"initial": None, "final": None},
+    }
+
+    if args.run_orca:
+        initial_ase = results["initial_ase"]
+        final_ase = results["final_ase"]
+        freeze = results["freeze_atoms"]
+        fg_bonds = results.get("fg_bond_constraints") or []
+
+        print("\n--- Step 1: UFF optimization (initial endpoint) ---")
+        if constrain:
+            print("  (constrained: surface + Zn frozen, FG-surface bonds fixed, only FG relax)")
+        try:
+            if optimize_with_uff(
+                initial_ase,
+                freeze_indices=freeze,
+                bond_constraints=fg_bonds,
+            ):
+                write(output_dir / "initial.xyz", initial_ase, format="xyz")
+                print("  Updated initial.xyz with optimized geometry")
+            else:
+                print("  Warning: UFF optimization did not complete successfully")
+        except ImportError as e:
+            print(f"  Error: {e}")
+            print("  Install Open Babel: pip install openbabel-wheel")
+
+        print("\n--- Step 2: UFF optimization (final endpoint) ---")
+        try:
+            if optimize_with_uff(
+                final_ase,
+                freeze_indices=freeze,
+                bond_constraints=fg_bonds,
+            ):
+                write(output_dir / "final.xyz", final_ase, format="xyz")
+                print("  Updated final.xyz with optimized geometry")
+            else:
+                print("  Warning: UFF optimization did not complete successfully")
+        except ImportError as e:
+            print(f"  Error: {e}")
+
+        output_data["optimization_run"] = True
+
+    if output_data["optimization_run"]:
+        print("\n" + "=" * 50)
+        print("   ENDPOINTS-ONLY SUMMARY (UFF)")
+        print("=" * 50)
+        print("  Geometries optimized. UFF energies not reported (use ORCA for DFT energies).")
+        print("=" * 50)
+
+    try:
+        with open(args.json_output, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"\nResults summary saved to: {args.json_output}")
+    except Exception as e:
+        print(f"\nWarning: Could not save JSON output: {e}")
+
+    if not output_data["optimization_run"]:
+        print("\nTo run UFF optimization:")
+        print(
+            f"  run-adsorption --endpoints-only --calculator uff "
+            f"--start-distance {args.start_distance} --end-distance {args.end_distance} "
+            f"--run -O {args.output_dir}"
+        )
+
+
+def _run_endpoints_only_orca(args: argparse.Namespace) -> None:
+    """Endpoints-only workflow using ORCA (DFT, slower)."""
+    try:
+        size, start_distance, end_distance = validate_inputs(args)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+
+    basis = "def2-SVP" if (args.endpoints_only and args.basis == "def2-TZVP") else args.basis
+
+    print("--- Preparing Endpoints-Only Calculation (ORCA) ---")
+    print(f"Surface size: {size[0]}x{size[1]}")
+    print(f"Functional groups: {args.carboxyl} carboxylate, {args.hydroxyl} hydroxyl")
+    print(f"Zn2+ start distance: {start_distance} Angstroms")
+    print(f"Zn2+ end distance: {end_distance} Angstroms")
+    print(f"Basis set: {basis}")
+
+    nprocs = 1 if args.no_mpi else args.nprocs
+    if args.no_mpi:
+        print("Running in serial mode (no MPI/parallel execution)")
+
+    orca_gen = OrcaInputGenerator(
+        method=args.method,
+        basis_set=basis,
+        solvent=args.solvent,
+        solvation_model=args.solvation,
+        memory=args.memory,
+        nprocs=nprocs,
+        scf_convergence=args.scf_convergence,
+        grid=f"DefGrid{args.grid}",
+    )
+    calc = NebCalculator(orca_generator=orca_gen)
+    output_dir = Path(args.output_dir)
+
+    results = calc.prepare_endpoints_only(
+        num_carboxyl=args.carboxyl,
+        num_hydroxyl=args.hydroxyl,
+        surface_size=size,
+        start_distance=start_distance,
+        end_distance=end_distance,
+        output_dir=output_dir,
+        constrain_endpoints=not getattr(args, "no_constrain_endpoints", False),
+        generate_orca_inputs=True,
+    )
+
+    print(f"\nORCA input files generated in: {args.output_dir}")
+    print(f"  - initial.inp (initial endpoint optimization)")
+    print(f"  - final.inp (final endpoint optimization)")
+    print(f"  - initial.xyz (initial structure)")
+    print(f"  - final.xyz (final structure)")
+
+    orca_available, orca_path = check_orca_available()
+    output_data = {
+        "parameters": dict(vars(args), basis=basis),
+        "calculator": "orca",
+        "files": {
+            "initial_input": str(output_dir / "initial.inp"),
+            "final_input": str(output_dir / "final.inp"),
+            "initial_xyz": str(output_dir / "initial.xyz"),
+            "final_xyz": str(output_dir / "final.xyz"),
+        },
+        "orca_available": orca_available,
+        "orca_run": False,
+        "energies": {"initial": None, "final": None},
+    }
+
+    if args.run_orca:
+        if not orca_available:
+            print("\nWarning: ORCA not found. Skipping execution.")
+        else:
+            print("\nORCA found at:", orca_path)
+            output_data["orca_run"] = True
+
+            initial_inp = output_dir / "initial.inp"
+            initial_out = output_dir / "initial.out"
+            initial_xyz = output_dir / "initial.xyz"
+            final_inp = output_dir / "final.inp"
+            final_out = output_dir / "final.out"
+            final_xyz = output_dir / "final.xyz"
+
+            print("\n--- Step 1: Optimizing initial endpoint ---")
+            if not getattr(args, "no_constrain_endpoints", False):
+                print("  (constrained: surface frozen, Zn-surface distance fixed, functional groups relaxed)")
+            if run_orca_command(initial_inp, initial_out, orca_path, no_mpi=args.no_mpi):
+                initial_energy = extract_energy_from_orca(initial_out)
+                output_data["energies"]["initial"] = initial_energy
+                if initial_energy is not None:
+                    print(f"  Initial endpoint energy: {initial_energy:.8f} Hartree")
+                if extract_optimized_geometry_from_orca(initial_out, initial_xyz):
+                    print(f"  Updated {initial_xyz.name} with optimized geometry")
+
+            print("\n--- Step 2: Optimizing final endpoint ---")
+            if run_orca_command(final_inp, final_out, orca_path, no_mpi=args.no_mpi):
+                final_energy = extract_energy_from_orca(final_out)
+                output_data["energies"]["final"] = final_energy
+                if final_energy is not None:
+                    print(f"  Final endpoint energy: {final_energy:.8f} Hartree")
+                if extract_optimized_geometry_from_orca(final_out, final_xyz):
+                    print(f"  Updated {final_xyz.name} with optimized geometry")
+
+    if output_data["orca_run"]:
+        print("\n" + "=" * 50)
+        print("   ENDPOINTS-ONLY SUMMARY (ORCA)")
+        print("=" * 50)
+        e_initial = output_data["energies"]["initial"]
+        e_final = output_data["energies"]["final"]
+        if e_initial is not None:
+            print(f"E(initial):  {e_initial:15.8f} Hartree")
+        else:
+            print(f"E(initial):  {'(calculation incomplete)':>15}")
+        if e_final is not None:
+            print(f"E(final):    {e_final:15.8f} Hartree")
+        else:
+            print(f"E(final):    {'(calculation incomplete)':>15}")
+        print("=" * 50)
+
+    try:
+        with open(args.json_output, "w") as f:
+            json.dump(output_data, f, indent=2)
+        print(f"\nResults summary saved to: {args.json_output}")
+    except Exception as e:
+        print(f"\nWarning: Could not save JSON output: {e}")
+
+    if not output_data["orca_run"]:
+        print("\nTo run the calculations manually:")
+        print(f"  cd {args.output_dir}")
+        print("  orca initial.inp > initial.out")
+        print("  orca final.inp > final.out")
+
+
+def run_endpoints_only_calculation(args: argparse.Namespace) -> None:
+    """
+    Endpoints-only workflow: generate and optionally run initial and final endpoint optimizations.
+    Uses UFF by default (fast); use --calculator orca for DFT.
+    """
+    calculator = getattr(args, "calculator", "uff")
+    if calculator == "uff":
+        _run_endpoints_only_uff(args)
+    else:
+        _run_endpoints_only_orca(args)
+
+
 def run_calculation(args: argparse.Namespace):
-    """Main MEP workflow: FSM (default) or NEB."""
+    """Main MEP workflow: FSM (default), NEB, or endpoints-only."""
+    if args.endpoints_only:
+        run_endpoints_only_calculation(args)
+        return
     if args.path_method == "fsm":
         run_fsm_calculation(args)
         return
 
+    calculator = getattr(args, "calculator", "orca")
+
+    # Distance scan
+    if args.path_method == "scan":
+        if getattr(args, "fg_sweep", False):
+            _run_scan_fg_sweep(args, calculator)
+            return
+        if calculator == "rowan":
+            _run_scan_rowan(args)
+            return
+        if calculator != "uff":
+            print("Warning: Scan with non-Rowan calculator uses UFF only. Ignoring --calculator orca.")
+        _run_scan_uff(args)
+        return
+
+    # NEB with UFF (in-process, fast)
+    if args.path_method == "neb" and calculator == "uff":
+        _run_neb_uff(args)
+        return
+
+    # NEB with ORCA (DFT, external)
     try:
         size, start_distance, end_distance = validate_inputs(args)
     except ValueError as e:
@@ -962,7 +1788,7 @@ def run_calculation(args: argparse.Namespace):
         
     print(f"--- Preparing Zn2+ NEB Calculation ---")
     print(f"Surface size: {size[0]}x{size[1]}")
-    print(f"Functional groups: {args.carboxyl} carboxyl, {args.hydroxyl} hydroxyl")
+    print(f"Functional groups: {args.carboxyl} carboxylate, {args.hydroxyl} hydroxyl")
     print(f"Zn2+ start distance: {start_distance} Angstroms")
     print(f"Zn2+ end distance: {end_distance} Angstroms")
     print(f"NEB images: {neb_images}")
@@ -994,7 +1820,8 @@ def run_calculation(args: argparse.Namespace):
         start_distance=start_distance,
         end_distance=end_distance,
         neb_images=neb_images,
-        output_dir=output_dir
+        output_dir=output_dir,
+        constrain_endpoints=not getattr(args, "no_constrain_endpoints", False),
     )
     
     print(f"\nORCA input files generated in: {args.output_dir}")
@@ -1045,8 +1872,10 @@ def run_calculation(args: argparse.Namespace):
             
             # Pre-optimize endpoints unless skipped
             if not args.skip_endpoint_opt:
-                # Step 1: Pre-optimize initial endpoint (unconstrained)
+                # Step 1: Pre-optimize initial endpoint
                 print("\n--- Step 1: Pre-optimizing initial endpoint ---")
+                if not getattr(args, "no_constrain_endpoints", False):
+                    print("  (constrained: surface frozen, Zn-surface distance fixed, functional groups relaxed)")
                 print("  (This can be skipped with --skip-endpoint-opt; PREOPT_ENDS will handle it)")
                 if run_orca_command(initial_inp, initial_out, orca_path, no_mpi=args.no_mpi):
                     initial_energy = extract_energy_from_orca(initial_out)
@@ -1058,7 +1887,7 @@ def run_calculation(args: argparse.Namespace):
                     if extract_optimized_geometry_from_orca(initial_out, initial_xyz):
                         print(f"  Updated {initial_xyz.name} with optimized geometry")
                 
-                # Step 2: Pre-optimize final endpoint (unconstrained)
+                # Step 2: Pre-optimize final endpoint
                 print("\n--- Step 2: Pre-optimizing final endpoint ---")
                 if run_orca_command(final_inp, final_out, orca_path, no_mpi=args.no_mpi):
                     final_energy = extract_energy_from_orca(final_out)

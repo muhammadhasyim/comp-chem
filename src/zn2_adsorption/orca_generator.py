@@ -66,13 +66,15 @@ class OrcaInputGenerator:
     
     def generate_from_ase(
         self,
-        atoms: Union[Atoms, np.ndarray], # Can also take symbols+positions later if needed
+        atoms: Union[Atoms, np.ndarray],  # Can also take symbols+positions later if needed
         calc_type: str = "opt",
         output_file: Optional[Union[str, Path]] = None,
         title: str = "ORCA Calculation",
         atom1_idx: Optional[int] = None,
         atom2_idx: Optional[int] = None,
-        distance: Optional[float] = None
+        distance: Optional[float] = None,
+        freeze_atoms: Optional[List[int]] = None,
+        bond_constraints: Optional[List[Tuple[int, int, float]]] = None,
     ) -> str:
         """
         Generate ORCA input from ASE Atoms object.
@@ -82,7 +84,8 @@ class OrcaInputGenerator:
         
         command = self._build_command(calc_type)
         input_content = self._build_input_file(
-            atoms, command, title, atom1_idx, atom2_idx, distance
+            atoms, command, title, atom1_idx, atom2_idx, distance, freeze_atoms,
+            bond_constraints=bond_constraints,
         )
         
         if output_file:
@@ -129,7 +132,9 @@ class OrcaInputGenerator:
         title: str,
         atom1_idx: Optional[int] = None,
         atom2_idx: Optional[int] = None,
-        distance: Optional[float] = None
+        distance: Optional[float] = None,
+        freeze_atoms: Optional[List[int]] = None,
+        bond_constraints: Optional[List[Tuple[int, int, float]]] = None,
     ) -> str:
         lines = [
             command,
@@ -158,11 +163,12 @@ class OrcaInputGenerator:
         # Only add %cpcm block if we need additional CPCM settings (not needed for basic usage)
         # For SMD, we might need a %smd block, but SMD(solvent=...) in simple line should work
             
-        if atom1_idx is not None and atom2_idx is not None and distance is not None:
-            lines.extend([
-                "",
-                self.add_distance_constraint(atoms, atom1_idx, atom2_idx, distance)
-            ])
+        geom_block = self._build_geom_constraints(
+            atoms, atom1_idx, atom2_idx, distance, freeze_atoms,
+            bond_constraints=bond_constraints,
+        )
+        if geom_block:
+            lines.extend(["", geom_block])
         
         lines.extend([
             "",
@@ -192,9 +198,9 @@ class OrcaInputGenerator:
         Generate ORCA distance constraint block.
         Uses unit matrix Hessian (InHess 1) for stability with constraints.
         """
-        # ORCA uses 1-based indexing for constraints
-        n1 = atom1_idx + 1
-        n2 = atom2_idx + 1
+        # ORCA uses 0-based indexing for constraints
+        n1 = atom1_idx
+        n2 = atom2_idx
         
         constraint_block = f"""%geom
  InHess Unit
@@ -203,6 +209,44 @@ class OrcaInputGenerator:
  end
 end"""
         return constraint_block
+
+    def _build_geom_constraints(
+        self,
+        atoms: Atoms,
+        atom1_idx: Optional[int],
+        atom2_idx: Optional[int],
+        distance: Optional[float],
+        freeze_atoms: Optional[List[int]],
+        bond_constraints: Optional[List[Tuple[int, int, float]]] = None,
+    ) -> str:
+        """
+        Build %geom block with optional distance constraint and/or atom freezing.
+        Freezes atoms (carbon surface), optionally constrains Zn-surface distance,
+        and constrains FG-surface bonds so attachment points don't detach.
+        Uses InHess Unit for stability with constraints.
+        """
+        # ORCA uses 0-based indexing for constraints
+        constraints: List[str] = []
+        if freeze_atoms:
+            for idx in sorted(set(freeze_atoms)):
+                if 0 <= idx < len(atoms):
+                    constraints.append(f"  {{ C {idx} C }}")
+        if atom1_idx is not None and atom2_idx is not None and distance is not None:
+            n1, n2 = atom1_idx, atom2_idx
+            constraints.append(f"  {{ B {n1} {n2} {distance:.6f} C }}")
+        if bond_constraints:
+            for i, j, d in bond_constraints:
+                if 0 <= i < len(atoms) and 0 <= j < len(atoms):
+                    constraints.append(f"  {{ B {i} {j} {d:.6f} C }}")
+        if not constraints:
+            return ""
+        constraint_lines = "\n".join(constraints)
+        return f"""%geom
+ InHess Unit
+ Constraints
+{constraint_lines}
+ end
+end"""
 
     def generate_neb_input(
         self,

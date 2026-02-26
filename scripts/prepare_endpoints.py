@@ -108,10 +108,17 @@ def run(
 
     calc = NebCalculator()
     pristine = calc.surface_builder.build_pristine_surface(supercell_size=size)
-    surface = calc.surface_builder.add_functional_groups(
+    # Zn center (x,y) for clustered FG placement
+    c_coords = [s.coords for s in pristine if s.specie.symbol == "C"]
+    zn_center = (
+        sum(c[0] for c in c_coords) / len(c_coords),
+        sum(c[1] for c in c_coords) / len(c_coords),
+    )
+    surface, _ = calc.surface_builder.add_functional_groups(
         pristine,
         num_carboxyl=carboxyl,
         num_hydroxyl=hydroxyl,
+        zn_center_xy=zn_center,
     )
     initial_pmg = calc.create_initial_structure(surface.copy(), start_distance)
     final_pmg = calc.create_final_structure(surface.copy(), end_distance)

@@ -66,11 +66,12 @@ class NebCalculator:
         start_distance: float = 5.0,
         end_distance: float = 2.5,
         neb_images: Optional[int] = None,
-        output_dir: Optional[Union[str, Path]] = None
+        output_dir: Optional[Union[str, Path]] = None,
+        constrain_endpoints: bool = True
     ) -> Dict[str, str]:
         """
         Prepare NEB calculation workflow.
-        
+
         Args:
             num_carboxyl: Number of carboxyl groups
             num_hydroxyl: Number of hydroxyl groups
@@ -79,7 +80,10 @@ class NebCalculator:
             end_distance: Final Zn²⁺ distance from surface (Å)
             neb_images: Number of NEB images (None = auto-calculate)
             output_dir: Directory for output files
-        
+            constrain_endpoints: If True, freeze carbon surface and fix Zn-surface
+                distance during endpoint optimization (avoids steric hindrance
+                by relaxing only functional groups). Default True.
+
         Returns:
             Dictionary with paths to generated input files
         """
@@ -89,10 +93,13 @@ class NebCalculator:
         
         # 1. Build functionalized surface (common to both endpoints)
         pristine = self.surface_builder.build_pristine_surface(supercell_size=surface_size)
-        surface_structure = self.surface_builder.add_functional_groups(
+        c_coords = np.array([s.coords for s in pristine if s.specie.symbol == "C"])
+        zn_center = (float(np.mean(c_coords[:, 0])), float(np.mean(c_coords[:, 1])))
+        surface_structure, _ = self.surface_builder.add_functional_groups(
             pristine,
             num_carboxyl=num_carboxyl,
-            num_hydroxyl=num_hydroxyl
+            num_hydroxyl=num_hydroxyl,
+            zn_center_xy=zn_center,
         )
         
         # 2. Create initial structure (Zn²⁺ at start_distance)
@@ -115,37 +122,57 @@ class NebCalculator:
         initial_ase = self._pmg_to_ase(initial_structure)
         final_ase = self._pmg_to_ase(final_structure)
         
-        # 6. Generate unconstrained optimization inputs for endpoints
-        # According to ORCA documentation, endpoints should be optimized separately
-        # without constraints. PREOPT_ENDS TRUE in NEB will handle re-optimization.
-        # Set charge and multiplicity
-        self.orca_gen.charge = 2
-        self.orca_gen.multiplicity = self._calculate_multiplicity(initial_ase, charge=2)
+        # 6. Set up constraints for endpoint optimization
+        # Carbon surface = indices 0..n_graphene-1; functional groups + Zn = flexible
+        n_graphene = len(pristine)
+        freeze_atoms = list(range(n_graphene)) if constrain_endpoints else None
         
-        # Initial endpoint (unconstrained optimization)
-        # This allows the structure to relax naturally while maintaining approximate distance
+        def _endpoint_constraints(atoms_ase, structure_pmg):
+            zn_idx = len(atoms_ase) - 1
+            zn_pos = structure_pmg.cart_coords[zn_idx]
+            nearest_idx, actual_dist = self.surface_builder.find_nearest_surface_atom(
+                structure_pmg, zn_pos
+            )
+            return zn_idx, nearest_idx, actual_dist
+        
+        initial_zn, initial_nearest, initial_dist = _endpoint_constraints(
+            initial_ase, initial_structure
+        )
+        final_zn, final_nearest, final_dist = _endpoint_constraints(
+            final_ase, final_structure
+        )
+        
+        # 7. Generate optimization inputs for endpoints
+        # Charge: Zn²⁺ (+2) + n carboxylate (-1 each) = 2 - num_carboxyl
+        charge = 2 - num_carboxyl
+        self.orca_gen.charge = charge
+        self.orca_gen.multiplicity = self._calculate_multiplicity(initial_ase, charge=charge)
+        
+        # Initial endpoint: freeze surface + fix Zn-surface distance; relax functional groups
         initial_input = self.orca_gen.generate_from_ase(
             initial_ase,
             calc_type="opt",
             output_file=output_dir / "initial.inp" if output_dir else None,
             title="Initial endpoint (Zn²⁺ at start distance)",
-            atom1_idx=None,  # No constraints
-            atom2_idx=None,
-            distance=None
+            atom1_idx=initial_zn if constrain_endpoints else None,
+            atom2_idx=initial_nearest if constrain_endpoints else None,
+            distance=initial_dist if constrain_endpoints else None,
+            freeze_atoms=freeze_atoms
         )
         
-        # Final endpoint (unconstrained optimization)
+        # Final endpoint: same constraints
         final_input = self.orca_gen.generate_from_ase(
             final_ase,
             calc_type="opt",
             output_file=output_dir / "final.inp" if output_dir else None,
             title="Final endpoint (Zn²⁺ at end distance)",
-            atom1_idx=None,  # No constraints
-            atom2_idx=None,
-            distance=None
+            atom1_idx=final_zn if constrain_endpoints else None,
+            atom2_idx=final_nearest if constrain_endpoints else None,
+            distance=final_dist if constrain_endpoints else None,
+            freeze_atoms=freeze_atoms
         )
         
-        # 8. Export structures as XYZ files for NEB
+        # 8. Export structures as XYZ files (unoptimized; will be overwritten after opt)
         if output_dir:
             self._export_xyz(initial_ase, output_dir / "initial.xyz")
             self._export_xyz(final_ase, output_dir / "final.xyz")
@@ -165,6 +192,162 @@ class NebCalculator:
             "neb_input": neb_input,
             "initial_xyz": str(output_dir / "initial.xyz") if output_dir else None,
             "final_xyz": str(output_dir / "final.xyz") if output_dir else None
+        }
+
+    def prepare_endpoints_only(
+        self,
+        num_carboxyl: int = 0,
+        num_hydroxyl: int = 0,
+        surface_size: Tuple[int, int] = (4, 4),
+        start_distance: float = 5.0,
+        end_distance: float = 2.5,
+        output_dir: Optional[Union[str, Path]] = None,
+        constrain_endpoints: bool = True,
+        generate_orca_inputs: bool = True,
+    ) -> Dict[str, str]:
+        """
+        Prepare endpoint structures (and optionally ORCA inputs).
+
+        Generates constrained endpoint optimizations: surface frozen, Zn-surface
+        distance fixed, functional groups relaxed. No neb.inp file is created.
+
+        Args:
+            num_carboxyl: Number of carboxyl groups
+            num_hydroxyl: Number of hydroxyl groups
+            surface_size: Surface supercell size (nx, ny)
+            start_distance: Initial Zn²⁺ distance from surface (Å)
+            end_distance: Final Zn²⁺ distance from surface (Å)
+            output_dir: Directory for output files
+            constrain_endpoints: If True, freeze carbon surface and fix Zn-surface
+                distance during endpoint optimization. Default True.
+            generate_orca_inputs: If True, generate initial.inp and final.inp.
+                If False (e.g. for UFF mode), only export initial.xyz and final.xyz.
+
+        Returns:
+            Dictionary with initial_xyz, final_xyz, and optionally initial_input,
+            final_input when generate_orca_inputs is True.
+        """
+        if output_dir:
+            output_dir = Path(output_dir)
+            output_dir.mkdir(parents=True, exist_ok=True)
+
+        # 1-8: Same as prepare_neb_calculation, but skip neb.inp
+        pristine = self.surface_builder.build_pristine_surface(supercell_size=surface_size)
+        c_coords = np.array([s.coords for s in pristine if s.specie.symbol == "C"])
+        zn_center = (float(np.mean(c_coords[:, 0])), float(np.mean(c_coords[:, 1])))
+        surface_structure, fg_bonds = self.surface_builder.add_functional_groups(
+            pristine,
+            num_carboxyl=num_carboxyl,
+            num_hydroxyl=num_hydroxyl,
+            zn_center_xy=zn_center,
+        )
+        initial_structure = self.create_initial_structure(
+            surface_structure.copy(),
+            start_distance
+        )
+        final_structure = self.create_final_structure(
+            surface_structure.copy(),
+            end_distance
+        )
+        initial_structure = self._ensure_atom_ordering(initial_structure)
+        final_structure = self._ensure_atom_ordering(final_structure)
+        initial_ase = self._pmg_to_ase(initial_structure)
+        final_ase = self._pmg_to_ase(final_structure)
+
+        n_graphene = len(pristine)
+        zn_idx = len(initial_ase) - 1
+        # Freeze carbon surface AND Zn ion so only functional groups optimize.
+        # This keeps Zn height and surface fixed; functional groups relax to avoid steric hindrance.
+        freeze_atoms = (
+            list(range(n_graphene)) + [zn_idx] if constrain_endpoints else None
+        )
+        # Constrain FG-surface bonds so the attachment doesn't stretch/detach
+        fg_bond_constraints = (
+            [(i, j, d) for i, j, d in fg_bonds] if constrain_endpoints else []
+        )
+
+        if output_dir:
+            self._export_xyz(initial_ase, output_dir / "initial.xyz")
+            self._export_xyz(final_ase, output_dir / "final.xyz")
+
+        result = {
+            "initial_xyz": str(output_dir / "initial.xyz") if output_dir else None,
+            "final_xyz": str(output_dir / "final.xyz") if output_dir else None,
+            "n_graphene": n_graphene,
+            "initial_ase": initial_ase,
+            "final_ase": final_ase,
+            "freeze_atoms": freeze_atoms,
+            "fg_bond_constraints": fg_bond_constraints,
+            "initial_bond_constraint": None,
+            "final_bond_constraint": None,
+        }
+        if generate_orca_inputs:
+            charge = 2 - num_carboxyl
+            self.orca_gen.charge = charge
+            self.orca_gen.multiplicity = self._calculate_multiplicity(
+                initial_ase, charge=charge
+            )
+            initial_input = self.orca_gen.generate_from_ase(
+                initial_ase,
+                calc_type="opt",
+                output_file=output_dir / "initial.inp" if output_dir else None,
+                title="Initial endpoint (Zn²⁺ at start distance)",
+                atom1_idx=None,
+                atom2_idx=None,
+                distance=None,
+                freeze_atoms=freeze_atoms,
+                bond_constraints=fg_bond_constraints,
+            )
+            final_input = self.orca_gen.generate_from_ase(
+                final_ase,
+                calc_type="opt",
+                output_file=output_dir / "final.inp" if output_dir else None,
+                title="Final endpoint (Zn²⁺ at end distance)",
+                atom1_idx=None,
+                atom2_idx=None,
+                distance=None,
+                freeze_atoms=freeze_atoms,
+                bond_constraints=fg_bond_constraints,
+            )
+            result["initial_input"] = initial_input
+            result["final_input"] = final_input
+        return result
+
+    def prepare_scan_base(
+        self,
+        num_carboxyl: int = 0,
+        num_hydroxyl: int = 0,
+        surface_size: Tuple[int, int] = (4, 4),
+    ) -> Dict:
+        """
+        Build base surface with functional groups (no Zn) for distance scan.
+
+        Returns surface structure and metadata needed to create structures
+        at arbitrary Zn-surface distances.
+
+        Returns:
+            Dict with:
+                - surface_structure: pymatgen Structure (FGs, no Zn)
+                - n_graphene: number of carbon atoms
+                - fg_bond_constraints: list of (i, j, d) for FG-surface bonds
+        """
+        pristine = self.surface_builder.build_pristine_surface(
+            supercell_size=surface_size
+        )
+        c_coords = np.array([s.coords for s in pristine if s.specie.symbol == "C"])
+        zn_center = (float(np.mean(c_coords[:, 0])), float(np.mean(c_coords[:, 1])))
+        surface_structure, fg_bonds = self.surface_builder.add_functional_groups(
+            pristine,
+            num_carboxyl=num_carboxyl,
+            num_hydroxyl=num_hydroxyl,
+            zn_center_xy=zn_center,
+        )
+        n_graphene = len(pristine)
+        fg_bond_constraints = [(i, j, d) for i, j, d in fg_bonds]
+        return {
+            "surface_structure": surface_structure,
+            "n_graphene": n_graphene,
+            "fg_bond_constraints": fg_bond_constraints,
         }
 
     def create_initial_structure(
